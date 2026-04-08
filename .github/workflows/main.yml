@@ -1,6 +1,6 @@
-name: Host Gemma 4B for Roo Code
+name: Host Gemma 4 E4B for Roo Code
 on:
-  workflow_dispatch: # Manual start
+  workflow_dispatch:
 
 jobs:
   host-gemma:
@@ -12,21 +12,18 @@ jobs:
       - name: Setup Ollama
         uses: ai-action/setup-ollama@v2
         with:
-          ollama-version: 'latest'
+          version: 'latest'
 
-      - name: Start Ollama and Pull Gemma 4B
+      - name: Pull Gemma 4 E4B
         run: |
-          # Start Ollama in the background
-          ollama serve & 
-          
-          # Wait for the API to be ready (Health Check)
-          echo "Waiting for Ollama server..."
+          echo "Waiting for Ollama to be ready..."
           until curl -s http://localhost:11434/api/tags > /dev/null; do
-            sleep 5
+            sleep 2
           done
           
-          echo "Ollama is up! Pulling Gemma 4B..."
-          ollama pull gemma:4b
+          echo "Pulling Gemma 4 E4B..."
+          # Model tag corrected to the official library format
+          ollama pull gemma4:e4b
 
       - name: Setup Cloudflare Tunnel
         uses: AnimMouse/setup-cloudflared@v2
@@ -36,9 +33,4 @@ jobs:
           cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
 
       - name: Keep Runner Alive
-        # Standard GitHub runners time out after 6 hours
         run: sleep 21600 
-
-      - name: Shutdown Tunnel
-        if: always()
-        uses: AnimMouse/setup-cloudflared/shutdown@v2
