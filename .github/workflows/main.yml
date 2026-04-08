@@ -1,18 +1,77 @@
-      - name: Install Ollama (Alternative - Direct Binary)
+name: Host Gemma 4 E4B for Roo Code
+on:
+  workflow_dispatch:
+
+jobs:
+  host-gemma:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Ollama
         run: |
-          # Download with follow-redirects
-          curl -L -o ollama-linux-amd64 https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64
-          sudo install -o root -g root -m 0755 ollama-linux-amd64 /usr/local/bin/ollama
+          # Download Ollama using curl with -L flag to follow redirects
+          echo "Downloading Ollama binary..."
+          sudo curl -L https://ollama.com/download/ollama-linux-amd64 -o /usr/local/bin/ollama
           
-          # Start Ollama
+          # Make it executable
+          sudo chmod +x /usr/local/bin/ollama
+          
+          # Verify download was successful
+          if [ ! -f /usr/local/bin/ollama ] || [ $(stat -c%s /usr/local/bin/ollama) -lt 1000000 ]; then
+            echo "ERROR: Ollama binary download failed or file too small"
+            exit 1
+          fi
+          
+          echo "Ollama binary downloaded successfully ($(stat -c%s /usr/local/bin/ollama) bytes)"
+          
+          # Start Ollama in the background
+          echo "Starting Ollama service..."
           ollama serve &
           
-          sleep 5
-          for i in {1..20}; do
+          # Wait for Ollama to be ready
+          echo "Waiting for Ollama API to be ready..."
+          for i in {1..30}; do
             if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✓ Ollama is active!"
+              echo "✓ Ollama is ready!"
               break
             fi
-            echo "Waiting for Ollama... (attempt $i/20)"
-            sleep 3
+            echo "Attempt $i/30 - Ollama starting up..."
+            sleep 2
           done
+          
+          # Final check
+          if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "✓ Ollama API is responding"
+            ollama --version
+          else
+            echo "ERROR: Ollama failed to start properly"
+            exit 1
+          fi
+
+      - name: Pull Gemma 4 E4B
+        run: |
+          echo "Pulling gemma4:e4b model..."
+          echo "Size: ~9.6GB"
+          echo "This may take 15-30 minutes..."
+          ollama pull gemma4:e4b
+          echo "✓ Model pull complete!"
+
+      - name: Verify Model
+        run: |
+          echo "Available models:"
+          ollama list
+          echo ""
+          echo "Testing model..."
+          echo "Hello" | ollama run gemma4:e4b
+
+      - name: Setup Cloudflare Tunnel
+        uses: AnimMouse/setup-cloudflared@v2
+        with:
+          cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
+          cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
+          cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
+
+      - name: Keep Runner Alive
+        run: sleep 21600
