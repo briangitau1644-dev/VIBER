@@ -9,90 +9,70 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install llama.cpp
+      - name: Install Ollama (Official Method)
         run: |
-          # Install dependencies
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake
+          # Install Ollama using official script
+          curl -fsSL https://ollama.com/install.sh | sh
           
-          # Clone and build llama.cpp
-          git clone https://github.com/ggerganov/llama.cpp
-          cd llama.cpp
-          mkdir build
-          cd build
-          cmake ..
-          cmake --build . --config Release -j $(nproc)
+          # Start Ollama service
+          sudo systemctl start ollama
           
-          # Copy server binary to PATH
-          sudo cp bin/server /usr/local/bin/llama-server
-          
-          echo "✓ llama.cpp installed successfully"
-
-      - name: Download Gemma 4 E4B Model (GGUF)
-        run: |
-          cd llama.cpp
-          mkdir -p models
-          
-          echo "Downloading Gemma 4 E4B quantized model..."
-          # Download Q4_K_M version (fits in 7GB RAM)
-          wget -O models/gemma-4-e4b.Q4_K_M.gguf \
-            https://huggingface.co/bartowski/Google_Gemma-4-E4B-it-GGUF/resolve/main/Google_Gemma-4-E4B-it-Q4_K_M.gguf
-          
-          # Verify download
-          if [ -f models/gemma-4-e4b.Q4_K_M.gguf ]; then
-            SIZE=$(du -h models/gemma-4-e4b.Q4_K_M.gguf | cut -f1)
-            echo "✓ Model downloaded successfully (Size: $SIZE)"
-          else
-            echo "ERROR: Model download failed"
-            exit 1
-          fi
-
-      - name: Start llama.cpp Server
-        run: |
-          cd llama.cpp
-          
-          # Start the server with optimized settings for GitHub runner
-          echo "Starting llama.cpp server..."
-          ./build/bin/server \
-            -m models/gemma-4-e4b.Q4_K_M.gguf \
-            --host 0.0.0.0 \
-            --port 8080 \
-            -ngl 20 \
-            --ctx-size 4096 \
-            --batch-size 512 \
-            --threads 4 \
-            > server.log 2>&1 &
-          
-          SERVER_PID=$!
-          echo "Server PID: $SERVER_PID"
-          
-          # Wait for server to be ready
-          echo "Waiting for server to be ready..."
+          # Wait for Ollama to be ready
+          echo "Waiting for Ollama to start..."
           for i in {1..30}; do
-            if curl -s http://localhost:8080/health > /dev/null 2>&1; then
-              echo "✓ Server is ready!"
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "✓ Ollama is ready!"
               break
             fi
-            echo "Attempt $i/30 - Server starting..."
+            echo "Attempt $i/30 - Ollama starting..."
             sleep 3
           done
+          
+          # Verify installation
+          ollama --version
 
-      - name: Test Model API
+      - name: Pull Gemma 4 E4B Model
         run: |
-          echo "Testing model with API call..."
+          echo "=========================================="
+          echo "Pulling gemma4:e4b model..."
+          echo "This model is approximately 9.6GB"
+          echo "Download may take 15-30 minutes"
+          echo "=========================================="
           
-          # Test completion endpoint
-          curl -X POST http://localhost:8080/completion \
+          # Pull the model
+          ollama pull gemma4:e4b
+          
+          echo "✓ Model pull complete!"
+
+      - name: Run Gemma 4 E4B Model
+        run: |
+          echo "Starting gemma4:e4b model..."
+          
+          # Start the model and keep it running
+          ollama run gemma4:e4b --keep-alive 6h &
+          
+          # Wait for model to load into memory
+          sleep 10
+          
+          # Test the model
+          echo "Testing model with simple prompt..."
+          echo '{"model":"gemma4:e4b","prompt":"Say ready in one word","stream":false}' | \
+            curl -X POST http://localhost:11434/api/generate \
             -H "Content-Type: application/json" \
-            -d '{
-              "prompt": "Say 'ready' in one word:",
-              "n_predict": 10,
-              "temperature": 0.7,
-              "stream": false
-            }' | grep -o '"content":"[^"]*"' || echo "Test completed"
+            -d @- | \
+            python3 -c "import sys, json; print('Response:', json.load(sys.stdin).get('response', 'N/A'))"
           
+          echo "✓ Model is running and ready for requests"
+
+      - name: Verify Model Status
+        run: |
+          echo "=========================================="
+          echo "Model Status:"
+          echo "=========================================="
+          ollama list
           echo ""
-          echo "✓ Model API is responding"
+          echo "Running processes:"
+          ps aux | grep ollama | grep -v grep || echo "No ollama process found"
 
       - name: Setup Cloudflare Tunnel
         uses: AnimMouse/setup-cloudflared@v2
@@ -101,30 +81,39 @@ jobs:
           cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
           cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
 
-      - name: Display Connection Info
+      - name: Display API Information
         run: |
           echo "=========================================="
-          echo "✓ llama.cpp API running at: http://localhost:8080"
-          echo "✓ Model: Google Gemma 4 E4B (Q4_K_M quantized)"
-          echo "✓ Context size: 4096 tokens"
+          echo "✓ Ollama API: http://localhost:11434"
+          echo "✓ Model: gemma4:e4b"
+          echo "✓ Status: Running"
           echo ""
           echo "API Endpoints:"
-          echo "  - POST /completion (text completion)"
-          echo "  - POST /chat/completions (chat format)"
+          echo "  - Generate: POST /api/generate"
+          echo "  - Chat: POST /api/chat"
+          echo "  - List Models: GET /api/tags"
           echo ""
-          echo "To connect from Roo Code:"
-          echo "  1. Use Cloudflare tunnel URL"
-          echo "  2. Endpoint: /v1/chat/completions (OpenAI compatible)"
-          echo "  3. Model: gemma-4-e4b"
-          echo "  4. API format: OpenAI compatible"
+          echo "OpenAI Compatible Endpoint:"
+          echo "  - http://localhost:11434/v1/chat/completions"
+          echo ""
+          echo "To use with Roo Code:"
+          echo "  1. Set API URL to your Cloudflare tunnel URL"
+          echo "  2. Add /v1/chat/completions to the end"
+          echo "  3. Model name: gemma4:e4b"
+          echo "  4. API format: OpenAI Compatible"
           echo ""
           echo "Example curl command:"
-          echo "  curl -X POST http://localhost:8080/chat/completions \\"
-          echo "    -H \"Content-Type: application/json\" \\"
-          echo "    -d '{\"model\":\"gemma-4-e4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+          echo "  curl -X POST http://localhost:11434/api/generate \\"
+          echo "    -H 'Content-Type: application/json' \\"
+          echo "    -d '{\"model\":\"gemma4:e4b\",\"prompt\":\"Hello\"}'"
           echo "=========================================="
           echo ""
           echo "Runner will stay alive for 6 hours"
+          echo "Press Ctrl+C to stop early"
 
       - name: Keep Runner Alive
-        run: sleep 21600
+        # Keeps the tunnel and model running for 6 hours (max GitHub limit)
+        run: |
+          echo "Keeping runner alive for 6 hours..."
+          echo "gemma4:e4b is ready to accept requests via Cloudflare tunnel"
+          sleep 21600
