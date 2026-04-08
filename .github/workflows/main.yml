@@ -9,119 +9,44 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install LM Studio CLI
+      - name: Install LM Studio via NPM
         run: |
-          # Download LM Studio for Linux
-          echo "Downloading LM Studio..."
-          curl -L https://releases.lmstudio.ai/linux/0.3.8/lm-studio-0.3.8-amd64.AppImage -o lm-studio.AppImage
-          chmod +x lm-studio.AppImage
+          # Install Node.js if not present
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
           
-          # Extract AppImage (no fuse needed)
-          echo "Extracting LM Studio..."
-          ./lm-studio.AppImage --appimage-extract
+          # Install LM Studio CLI from npm
+          npm install -g lm-studio-cli
           
-          # Create symbolic link
-          sudo ln -sf $(pwd)/squashfs-root/AppRun /usr/local/bin/lm-studio
-          
-          echo "✓ LM Studio installed"
+          echo "✓ LM Studio CLI installed"
 
-      - name: Download Gemma 4 E4B Model
+      - name: Download and Run Model with llama.cpp
         run: |
-          echo "Creating model directory..."
-          mkdir -p ~/.cache/lm-studio/models
+          # Install llama.cpp as alternative backend
+          git clone https://github.com/ggerganov/llama.cpp
+          cd llama.cpp
+          make -j4
           
-          echo "Downloading Gemma 4 E4B model from Hugging Face..."
-          # Install huggingface hub
-          pip install huggingface-hub
+          # Download Gemma 4 E4B GGUF
+          wget -O models/gemma-4-e4b.Q4_K_M.gguf \
+            https://huggingface.co/bartowski/Google_Gemma-4-E4B-it-GGUF/resolve/main/Google_Gemma-4-E4B-it-Q4_K_M.gguf
           
-          # Download the model (GGUF format recommended for LM Studio)
-          python3 -c "
-          from huggingface_hub import snapshot_download
-          snapshot_download(
-              repo_id='google/gemma-4-e4b-it-GGUF',
-              local_dir='~/.cache/lm-studio/models/gemma-4-e4b',
-              allow_patterns=['*.gguf']
-          )
-          " || echo "Trying alternative download..."
+          # Start server
+          ./server -m models/gemma-4-e4b.Q4_K_M.gguf \
+            --host 0.0.0.0 \
+            --port 1234 \
+            -ngl 32 \
+            --ctx-size 4096 &
           
-          # Alternative: Use wget for direct GGUF download if above fails
-          if [ ! -f ~/.cache/lm-studio/models/gemma-4-e4b/model.gguf ]; then
-            echo "Downloading GGUF model directly..."
-            wget -O ~/.cache/lm-studio/models/gemma-4-e4b-q4.gguf \
-              https://huggingface.co/bartowski/Google_Gemma-4-E4B-it-GGUF/resolve/main/Google_Gemma-4-E4B-it-Q4_K_M.gguf
-          fi
-          
-          echo "✓ Model downloaded"
-
-      - name: Start LM Studio Server
-        run: |
-          # Start LM Studio in headless server mode
-          echo "Starting LM Studio server..."
-          
-          # Create config file for LM Studio
-          cat > ~/.lmstudio-config.json << EOF
-          {
-            "port": 1234,
-            "host": "0.0.0.0",
-            "model": "gemma-4-e4b",
-            "contextLength": 4096,
-            "gpuLayers": 32,
-            "temperature": 0.7,
-            "maxTokens": 2048
-          }
-          EOF
-          
-          # Start server in background
-          lm-studio server --port 1234 --host 0.0.0.0 &
-          
-          # Wait for server to be ready
-          echo "Waiting for LM Studio API to be ready..."
-          for i in {1..30}; do
-            if curl -s http://localhost:1234/v1/models > /dev/null 2>&1; then
-              echo "✓ LM Studio is ready!"
+          # Wait for server
+          sleep 10
+          for i in {1..20}; do
+            if curl -s http://localhost:1234/health > /dev/null 2>&1; then
+              echo "✓ Server is ready!"
               break
             fi
-            echo "Attempt $i/30 - LM Studio starting up..."
             sleep 3
           done
-
-      - name: Load Model into Memory
-        run: |
-          echo "Loading Gemma 4 E4B model into memory..."
-          
-          # API call to load model
-          curl -X POST http://localhost:1234/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "gemma-4-e4b",
-              "messages": [{"role": "user", "content": "Hello"}],
-              "max_tokens": 5,
-              "stream": false
-            }' || echo "Model loading initiated"
-          
-          echo "✓ Model loaded and ready"
-
-      - name: Verify Model is Working
-        run: |
-          echo "Testing model with API call..."
-          
-          # Test the model
-          RESPONSE=$(curl -s -X POST http://localhost:1234/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "gemma-4-e4b",
-              "messages": [{"role": "user", "content": "Say ready in one word"}],
-              "max_tokens": 10,
-              "stream": false
-            }')
-          
-          echo "Response: $RESPONSE"
-          
-          if echo "$RESPONSE" | grep -q "ready"; then
-            echo "✓ Model is working correctly!"
-          else
-            echo "⚠️ Model test completed (check response above)"
-          fi
 
       - name: Setup Cloudflare Tunnel
         uses: AnimMouse/setup-cloudflared@v2
@@ -129,23 +54,6 @@ jobs:
           cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
           cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
           cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
-
-      - name: Display Connection Info
-        run: |
-          echo "=========================================="
-          echo "✓ LM Studio API running at: http://localhost:1234"
-          echo "✓ OpenAI-compatible endpoint: /v1/chat/completions"
-          echo "✓ Model: gemma-4-e4b"
-          echo "✓ Context length: 4096 tokens"
-          echo ""
-          echo "To connect from Roo Code:"
-          echo "1. Use Cloudflare tunnel URL"
-          echo "2. Set API endpoint to: /v1/chat/completions"
-          echo "3. Model name: gemma-4-e4b"
-          echo "4. API format: OpenAI compatible"
-          echo "=========================================="
-          echo ""
-          echo "Runner will stay alive for 6 hours"
 
       - name: Keep Runner Alive
         run: sleep 21600
