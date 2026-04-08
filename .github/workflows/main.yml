@@ -1,4 +1,4 @@
-name: Host Gemma 4 E4B for Roo Code
+name: Host Gemma 4 E4B for Roo Code (ngrok)
 on:
   workflow_dispatch:
 
@@ -11,141 +11,30 @@ jobs:
 
       - name: Install Ollama
         run: |
-          # Install Ollama using official script
           curl -fsSL https://ollama.com/install.sh | sh
-          
-          # Start Ollama service
           sudo systemctl start ollama
-          
-          # Wait for Ollama to be ready
-          echo "Waiting for Ollama to start..."
-          for i in {1..30}; do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "✓ Ollama is ready!"
-              break
-            fi
-            echo "Attempt $i/30 - Ollama starting..."
-            sleep 3
-          done
-          
-          # Verify installation
-          ollama --version
+          sleep 10
 
       - name: Pull Gemma 4 E4B Model
         run: |
-          echo "=========================================="
-          echo "Pulling gemma4:e4b model..."
-          echo "This model is approximately 9.6GB"
-          echo "Download may take 15-30 minutes"
-          echo "=========================================="
-          
-          # Pull the model
           ollama pull gemma4:e4b
-          
-          echo "✓ Model pull complete!"
-
-      - name: Start Gemma 4 E4B Model
-        run: |
-          echo "Starting gemma4:e4b model..."
-          
-          # Keep model loaded in memory
           ollama run gemma4:e4b &
+
+      - name: Install ngrok
+        run: |
+          curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+          echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+          sudo apt update
+          sudo apt install ngrok
           
-          # Wait for model to load
+          # Add your ngrok auth token (add to GitHub secrets)
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Start ngrok Tunnel
+        run: |
+          ngrok http 11434 --host-header="localhost:11434" &
           sleep 10
-          
-          # Test the model
-          echo "Testing model with simple prompt..."
-          RESPONSE=$(curl -s -X POST http://localhost:11434/api/generate \
-            -H "Content-Type: application/json" \
-            -d '{"model":"gemma4:e4b","prompt":"Say ready in one word","stream":false}')
-          
-          echo "Response: $RESPONSE"
-          echo "✓ Model is running and ready for requests"
-
-      - name: Install Cloudflared
-        run: |
-          # Install cloudflared directly
-          echo "Installing Cloudflared..."
-          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-          cloudflared --version
-          echo "✓ Cloudflared installed"
-
-      - name: Start Cloudflare Tunnel (Quick Tunnel)
-        run: |
-          echo "=========================================="
-          echo "Starting Cloudflare tunnel..."
-          echo "=========================================="
-          
-          # Start tunnel in background and capture output
-          cloudflared tunnel --url http://localhost:11434 --no-autoupdate 2>&1 | tee cloudflared.log &
-          
-          # Wait for tunnel to establish
-          echo "Waiting for tunnel to be ready..."
-          sleep 15
-          
-          # Extract tunnel URL from logs
-          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
-          
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "✓ Tunnel is active!"
-            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-            echo "✓ Tunnel URL: $TUNNEL_URL"
-          else
-            echo "⚠️ Could not extract tunnel URL automatically"
-            echo "Check the logs above for the tunnel URL"
-          fi
-
-      - name: Display Connection Info
-        run: |
-          echo "=========================================="
-          echo "✅ GEMMA 4 E4B IS READY FOR ROO CODE!"
-          echo "=========================================="
-          echo ""
-          echo "📡 Local API: http://localhost:11434"
-          echo "🤖 Model: gemma4:e4b"
-          echo ""
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "🌐 CLOUDFLARE TUNNEL URL:"
-            echo "   $TUNNEL_URL"
-            echo ""
-            echo "🔧 ROO CODE CONFIGURATION:"
-            echo "   1. API URL: $TUNNEL_URL/v1/chat/completions"
-            echo "   2. Model name: gemma4:e4b"
-            echo "   3. API format: OpenAI Compatible"
-          else
-            echo "🔍 Check the workflow logs above for the tunnel URL"
-            echo "   Look for: https://xxxxx.trycloudflare.com"
-          fi
-          echo ""
-          echo "🧪 TEST COMMAND:"
-          echo "   curl -X POST http://localhost:11434/v1/chat/completions \\"
-          echo "     -H 'Content-Type: application/json' \\"
-          echo "     -d '{\"model\":\"gemma4:e4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
-          echo ""
-          echo "⏱️  Runner will stay alive for 6 hours"
-          echo "=========================================="
+          curl -s http://localhost:4040/api/tunnels | grep -o 'https://[a-z0-9]*\.ngrok\.io'
 
       - name: Keep Runner Alive
-        run: |
-          echo "=========================================="
-          echo "✅ Service is running!"
-          echo "✅ Model: gemma4:e4b loaded"
-          echo "✅ Tunnel: Active"
-          echo "=========================================="
-          echo ""
-          echo "Keeping runner alive for 6 hours..."
-          echo "Press Ctrl+C to stop early"
-          echo ""
-          
-          # Display tunnel URL every minute
-          while true; do
-            if [ -f cloudflared.log ]; then
-              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
-              if [ -n "$TUNNEL_URL" ]; then
-                echo "[$(date '+%H:%M:%S')] Tunnel active at: $TUNNEL_URL"
-              fi
-            fi
-            sleep 60
-          done
+        run: sleep 21600
