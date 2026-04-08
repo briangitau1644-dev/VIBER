@@ -11,127 +11,109 @@ jobs:
 
       - name: Install Ollama
         run: |
-          # Install Ollama using official script
           curl -fsSL https://ollama.com/install.sh | sh
-          
-          # Start Ollama service
           sudo systemctl start ollama
           
           # Wait for Ollama to be ready
-          echo "Waiting for Ollama to start..."
           for i in {1..30}; do
             if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
               echo "✓ Ollama is ready!"
               break
             fi
-            echo "Attempt $i/30 - Ollama starting..."
             sleep 3
           done
-          
-          ollama --version
 
       - name: Pull Gemma 4 E4B Model
         run: |
-          echo "=========================================="
           echo "Pulling gemma4:e4b model (~9.6GB)..."
-          echo "This will take 15-30 minutes"
-          echo "=========================================="
-          
           ollama pull gemma4:e4b
-          
           echo "✓ Model pull complete!"
 
-      - name: Start Gemma 4 E4B Model
+      - name: PRE-LOAD MODEL INTO RAM (KEEP ALWAYS READY)
         run: |
-          echo "Starting gemma4:e4b model..."
+          echo "Loading Gemma 4 E4B into RAM..."
           
-          # Start Ollama server with CORS and all origins allowed
-          export OLLAMA_ORIGINS="*"
-          export OLLAMA_HOST="0.0.0.0"
+          # Start model with keep_alive = -1 (never unload)
+          # This forces the entire model into RAM and keeps it there
+          ollama run gemma4:e4b --keep-alive -1 &
           
-          # Run the model
-          ollama run gemma4:e4b &
+          # Wait for model to fully load into RAM
+          echo "Waiting for model to load into RAM..."
+          sleep 30
           
-          # Wait for model to load
-          sleep 20
-          
-          # Verify model is working
-          echo "Testing model locally..."
-          curl -X POST http://localhost:11434/v1/chat/completions \
+          # Verify model is loaded and responsive
+          echo "Testing model response..."
+          curl -X POST http://localhost:11434/api/generate \
             -H "Content-Type: application/json" \
             -d '{
               "model": "gemma4:e4b",
-              "messages": [{"role": "user", "content": "Say OK"}],
-              "max_tokens": 5
+              "prompt": "Say READY",
+              "stream": false,
+              "keep_alive": -1
             }'
           
-          echo "✓ Model is running"
+          echo "✓ Model is PRE-LOADED in RAM and ready for instant responses"
+
+      - name: Keep Model Warm (Prevent Unloading)
+        run: |
+          # Send keep-alive ping every 30 seconds to ensure model stays in RAM
+          while true; do
+            curl -s -X POST http://localhost:11434/api/generate \
+              -H "Content-Type: application/json" \
+              -d '{"model":"gemma4:e4b","prompt":"","keep_alive":-1}' \
+              > /dev/null 2>&1
+            sleep 30
+          done &
+          
+          echo "✓ Keep-alive service started - model will stay in RAM"
 
       - name: Install Cloudflared
         run: |
-          # Install cloudflared
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          cloudflared --version
 
       - name: Start Cloudflare Tunnel
         run: |
-          echo "=========================================="
-          echo "Starting Cloudflare tunnel..."
-          echo "=========================================="
-          
-          # Start tunnel
+          # Start tunnel to expose Ollama
           cloudflared tunnel --url http://localhost:11434 --no-autoupdate 2>&1 | tee cloudflared.log &
-          
-          # Wait for tunnel
           sleep 15
           
           # Extract tunnel URL
           TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
-          
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
-            echo "✓ Tunnel URL: $TUNNEL_URL"
-          fi
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
 
       - name: Display Connection Info
         run: |
           echo "=========================================="
-          echo "✅ GEMMA 4 E4B IS READY!"
+          echo "✅ GEMMA 4 E4B IS PRE-LOADED IN RAM!"
           echo "=========================================="
           echo ""
           echo "🌐 TUNNEL URL: $TUNNEL_URL"
           echo ""
-          echo "🔧 ROO CODE SETUP (DO NOT USE PROXY):"
+          echo "⚡ MODEL STATUS: ALWAYS IN RAM - READY FOR INSTANT RESPONSES"
           echo ""
-          echo "1. OPEN Roo Code Settings"
-          echo "2. Go to 'API Configuration'"
-          echo "3. Select Provider: 'OpenAI Compatible' (NOT proxy)"
-          echo "4. Configure:"
-          echo "   - API URL: $TUNNEL_URL/v1"
-          echo "   - Model ID: gemma4:e4b"
-          echo "   - API Key: (leave empty or type 'ollama')"
+          echo "🔧 ROO CODE CONFIGURATION:"
+          echo "   Provider: OpenAI Compatible"
+          echo "   API URL: $TUNNEL_URL/v1"
+          echo "   Model ID: gemma4:e4b"
+          echo "   API Key: (leave empty)"
           echo ""
-          echo "OR use this exact URL:"
-          echo "   $TUNNEL_URL/v1/chat/completions"
-          echo ""
-          echo "=========================================="
-          echo "TEST WITH CURL:"
-          echo "curl $TUNNEL_URL/v1/chat/completions \\"
-          echo "  -H 'Content-Type: application/json' \\"
-          echo "  -d '{\"model\":\"gemma4:e4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}'"
+          echo "⏱️  Model will stay in RAM for the full 6 hours"
           echo "=========================================="
 
-      - name: Keep Runner Alive
+      - name: Keep Runner Alive with RAM-loaded Model
         run: |
-          echo "Keeping runner alive for 6 hours..."
-          echo "Tunnel URL will be shown every minute"
+          echo "Model is PRE-LOADED in RAM - serving requests for 6 hours"
+          echo ""
           
+          # Display memory usage to confirm model is in RAM
           while true; do
             if [ -f cloudflared.log ]; then
               URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
               if [ -n "$URL" ]; then
-                echo "[$(date '+%H:%M:%S')] Active: $URL/v1"
+                # Show RAM usage (Ollama process)
+                RAM_USAGE=$(ps aux | grep ollama | grep -v grep | awk '{sum+=$6} END {print sum/1024 " MB"}')
+                echo "[$(date '+%H:%M:%S')] ✅ Model in RAM | URL: $URL/v1 | RAM: $RAM_USAGE"
               fi
             fi
             sleep 60
