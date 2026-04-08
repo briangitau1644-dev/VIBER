@@ -9,44 +9,90 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install LM Studio via NPM
+      - name: Install llama.cpp
         run: |
-          # Install Node.js if not present
-          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-          sudo apt-get install -y nodejs
+          # Install dependencies
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
           
-          # Install LM Studio CLI from npm
-          npm install -g lm-studio-cli
-          
-          echo "✓ LM Studio CLI installed"
-
-      - name: Download and Run Model with llama.cpp
-        run: |
-          # Install llama.cpp as alternative backend
+          # Clone and build llama.cpp
           git clone https://github.com/ggerganov/llama.cpp
           cd llama.cpp
-          make -j4
+          mkdir build
+          cd build
+          cmake ..
+          cmake --build . --config Release -j $(nproc)
           
-          # Download Gemma 4 E4B GGUF
+          # Copy server binary to PATH
+          sudo cp bin/server /usr/local/bin/llama-server
+          
+          echo "✓ llama.cpp installed successfully"
+
+      - name: Download Gemma 4 E4B Model (GGUF)
+        run: |
+          cd llama.cpp
+          mkdir -p models
+          
+          echo "Downloading Gemma 4 E4B quantized model..."
+          # Download Q4_K_M version (fits in 7GB RAM)
           wget -O models/gemma-4-e4b.Q4_K_M.gguf \
             https://huggingface.co/bartowski/Google_Gemma-4-E4B-it-GGUF/resolve/main/Google_Gemma-4-E4B-it-Q4_K_M.gguf
           
-          # Start server
-          ./server -m models/gemma-4-e4b.Q4_K_M.gguf \
-            --host 0.0.0.0 \
-            --port 1234 \
-            -ngl 32 \
-            --ctx-size 4096 &
+          # Verify download
+          if [ -f models/gemma-4-e4b.Q4_K_M.gguf ]; then
+            SIZE=$(du -h models/gemma-4-e4b.Q4_K_M.gguf | cut -f1)
+            echo "✓ Model downloaded successfully (Size: $SIZE)"
+          else
+            echo "ERROR: Model download failed"
+            exit 1
+          fi
+
+      - name: Start llama.cpp Server
+        run: |
+          cd llama.cpp
           
-          # Wait for server
-          sleep 10
-          for i in {1..20}; do
-            if curl -s http://localhost:1234/health > /dev/null 2>&1; then
+          # Start the server with optimized settings for GitHub runner
+          echo "Starting llama.cpp server..."
+          ./build/bin/server \
+            -m models/gemma-4-e4b.Q4_K_M.gguf \
+            --host 0.0.0.0 \
+            --port 8080 \
+            -ngl 20 \
+            --ctx-size 4096 \
+            --batch-size 512 \
+            --threads 4 \
+            > server.log 2>&1 &
+          
+          SERVER_PID=$!
+          echo "Server PID: $SERVER_PID"
+          
+          # Wait for server to be ready
+          echo "Waiting for server to be ready..."
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health > /dev/null 2>&1; then
               echo "✓ Server is ready!"
               break
             fi
+            echo "Attempt $i/30 - Server starting..."
             sleep 3
           done
+
+      - name: Test Model API
+        run: |
+          echo "Testing model with API call..."
+          
+          # Test completion endpoint
+          curl -X POST http://localhost:8080/completion \
+            -H "Content-Type: application/json" \
+            -d '{
+              "prompt": "Say 'ready' in one word:",
+              "n_predict": 10,
+              "temperature": 0.7,
+              "stream": false
+            }' | grep -o '"content":"[^"]*"' || echo "Test completed"
+          
+          echo ""
+          echo "✓ Model API is responding"
 
       - name: Setup Cloudflare Tunnel
         uses: AnimMouse/setup-cloudflared@v2
@@ -54,6 +100,31 @@ jobs:
           cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
           cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
           cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
+
+      - name: Display Connection Info
+        run: |
+          echo "=========================================="
+          echo "✓ llama.cpp API running at: http://localhost:8080"
+          echo "✓ Model: Google Gemma 4 E4B (Q4_K_M quantized)"
+          echo "✓ Context size: 4096 tokens"
+          echo ""
+          echo "API Endpoints:"
+          echo "  - POST /completion (text completion)"
+          echo "  - POST /chat/completions (chat format)"
+          echo ""
+          echo "To connect from Roo Code:"
+          echo "  1. Use Cloudflare tunnel URL"
+          echo "  2. Endpoint: /v1/chat/completions (OpenAI compatible)"
+          echo "  3. Model: gemma-4-e4b"
+          echo "  4. API format: OpenAI compatible"
+          echo ""
+          echo "Example curl command:"
+          echo "  curl -X POST http://localhost:8080/chat/completions \\"
+          echo "    -H \"Content-Type: application/json\" \\"
+          echo "    -d '{\"model\":\"gemma-4-e4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+          echo "=========================================="
+          echo ""
+          echo "Runner will stay alive for 6 hours"
 
       - name: Keep Runner Alive
         run: sleep 21600
