@@ -45,17 +45,25 @@ jobs:
         run: |
           echo "Starting gemma4:e4b model..."
           
-          # Start the model and keep it running
+          # Start Ollama server with CORS and all origins allowed
+          export OLLAMA_ORIGINS="*"
+          export OLLAMA_HOST="0.0.0.0"
+          
+          # Run the model
           ollama run gemma4:e4b &
           
           # Wait for model to load
-          sleep 15
+          sleep 20
           
           # Verify model is working
-          echo "Testing model..."
-          curl -X POST http://localhost:11434/api/generate \
+          echo "Testing model locally..."
+          curl -X POST http://localhost:11434/v1/chat/completions \
             -H "Content-Type: application/json" \
-            -d '{"model":"gemma4:e4b","prompt":"Say OK","stream":false}'
+            -d '{
+              "model": "gemma4:e4b",
+              "messages": [{"role": "user", "content": "Say OK"}],
+              "max_tokens": 5
+            }'
           
           echo "✓ Model is running"
 
@@ -72,12 +80,10 @@ jobs:
           echo "Starting Cloudflare tunnel..."
           echo "=========================================="
           
-          # Start tunnel with proper headers to avoid 403
-          cloudflared tunnel --url http://localhost:11434 \
-            --no-autoupdate \
-            --http-host-header=localhost:11434 2>&1 | tee cloudflared.log &
+          # Start tunnel
+          cloudflared tunnel --url http://localhost:11434 --no-autoupdate 2>&1 | tee cloudflared.log &
           
-          # Wait for tunnel to establish
+          # Wait for tunnel
           sleep 15
           
           # Extract tunnel URL
@@ -88,53 +94,44 @@ jobs:
             echo "✓ Tunnel URL: $TUNNEL_URL"
           fi
 
-      - name: Test Tunnel
-        run: |
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "Testing tunnel with API call..."
-            
-            # Test the tunnel
-            curl -X POST "$TUNNEL_URL/api/generate" \
-              -H "Content-Type: application/json" \
-              -d '{"model":"gemma4:e4b","prompt":"test","stream":false}'
-            
-            echo ""
-            echo "✓ Tunnel is working!"
-          fi
-
       - name: Display Connection Info
         run: |
           echo "=========================================="
           echo "✅ GEMMA 4 E4B IS READY!"
           echo "=========================================="
           echo ""
-          echo "🌐 CLOUDFLARE TUNNEL URL:"
-          echo "   $TUNNEL_URL"
+          echo "🌐 TUNNEL URL: $TUNNEL_URL"
           echo ""
-          echo "🔧 ROO CODE CONFIGURATION:"
-          echo "   API URL: $TUNNEL_URL/v1/chat/completions"
-          echo "   Model name: gemma4:e4b"
-          echo "   API Format: OpenAI Compatible"
-          echo "   API Key: (leave empty)"
+          echo "🔧 ROO CODE SETUP (DO NOT USE PROXY):"
           echo ""
-          echo "⚠️  IF YOU STILL GET 403 ERROR:"
-          echo "   1. In Roo Code settings, add a dummy API key: 'ollama'"
-          echo "   2. Or try using: $TUNNEL_URL/api/generate (non-OpenAI endpoint)"
-          echo "   3. Make sure CORS is disabled in Roo Code if possible"
+          echo "1. OPEN Roo Code Settings"
+          echo "2. Go to 'API Configuration'"
+          echo "3. Select Provider: 'OpenAI Compatible' (NOT proxy)"
+          echo "4. Configure:"
+          echo "   - API URL: $TUNNEL_URL/v1"
+          echo "   - Model ID: gemma4:e4b"
+          echo "   - API Key: (leave empty or type 'ollama')"
           echo ""
+          echo "OR use this exact URL:"
+          echo "   $TUNNEL_URL/v1/chat/completions"
+          echo ""
+          echo "=========================================="
+          echo "TEST WITH CURL:"
+          echo "curl $TUNNEL_URL/v1/chat/completions \\"
+          echo "  -H 'Content-Type: application/json' \\"
+          echo "  -d '{\"model\":\"gemma4:e4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}]}'"
           echo "=========================================="
 
       - name: Keep Runner Alive
         run: |
           echo "Keeping runner alive for 6 hours..."
-          echo "Model is ready for requests"
+          echo "Tunnel URL will be shown every minute"
           
-          # Keep showing tunnel URL
           while true; do
             if [ -f cloudflared.log ]; then
               URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
               if [ -n "$URL" ]; then
-                echo "[$(date '+%H:%M:%S')] Tunnel active: $URL"
+                echo "[$(date '+%H:%M:%S')] Active: $URL/v1"
               fi
             fi
             sleep 60
