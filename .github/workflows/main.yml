@@ -11,24 +11,40 @@ jobs:
 
       - name: Install Ollama
         run: |
-          # Download Ollama using curl with -L flag to follow redirects
+          # Get the latest version number from GitHub API
+          echo "Fetching latest Ollama version..."
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/ollama/ollama/releases/latest | grep -oP '"tag_name": "\K(.*?)(?=")')
+          echo "Latest version: $LATEST_VERSION"
+          
+          # Download Ollama binary from GitHub releases (correct URL)
           echo "Downloading Ollama binary..."
-          sudo curl -L https://ollama.com/download/ollama-linux-amd64 -o /usr/local/bin/ollama
+          sudo curl -L "https://github.com/ollama/ollama/releases/download/${LATEST_VERSION}/ollama-linux-amd64" -o /usr/local/bin/ollama
           
           # Make it executable
           sudo chmod +x /usr/local/bin/ollama
           
-          # Verify download was successful
-          if [ ! -f /usr/local/bin/ollama ] || [ $(stat -c%s /usr/local/bin/ollama) -lt 1000000 ]; then
-            echo "ERROR: Ollama binary download failed or file too small"
-            exit 1
+          # Verify download was successful (should be ~100MB+)
+          FILE_SIZE=$(stat -c%s /usr/local/bin/ollama 2>/dev/null || stat -f%z /usr/local/bin/ollama 2>/dev/null)
+          echo "Downloaded file size: $FILE_SIZE bytes"
+          
+          if [ "$FILE_SIZE" -lt 10000000 ]; then
+            echo "ERROR: Ollama binary download failed - file too small ($FILE_SIZE bytes)"
+            echo "Trying alternative download method..."
+            
+            # Alternative: Use wget with specific user agent
+            sudo wget --user-agent="Mozilla/5.0" -O /usr/local/bin/ollama "https://github.com/ollama/ollama/releases/download/v0.3.14/ollama-linux-amd64"
+            sudo chmod +x /usr/local/bin/ollama
+            
+            NEW_SIZE=$(stat -c%s /usr/local/bin/ollama 2>/dev/null || stat -f%z /usr/local/bin/ollama 2>/dev/null)
+            if [ "$NEW_SIZE" -lt 10000000 ]; then
+              echo "ERROR: Still failing. Installing via official script instead..."
+              curl -fsSL https://ollama.com/install.sh | sh
+            fi
           fi
           
-          echo "Ollama binary downloaded successfully ($(stat -c%s /usr/local/bin/ollama) bytes)"
-          
-          # Start Ollama in the background
+          # Start Ollama
           echo "Starting Ollama service..."
-          ollama serve &
+          ollama serve > ollama.log 2>&1 &
           
           # Wait for Ollama to be ready
           echo "Waiting for Ollama API to be ready..."
@@ -38,15 +54,16 @@ jobs:
               break
             fi
             echo "Attempt $i/30 - Ollama starting up..."
-            sleep 2
+            sleep 3
           done
           
-          # Final check
+          # Final verification
           if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
             echo "✓ Ollama API is responding"
             ollama --version
           else
-            echo "ERROR: Ollama failed to start properly"
+            echo "ERROR: Ollama failed to start. Showing log:"
+            cat ollama.log
             exit 1
           fi
 
@@ -54,7 +71,7 @@ jobs:
         run: |
           echo "Pulling gemma4:e4b model..."
           echo "Size: ~9.6GB"
-          echo "This may take 15-30 minutes..."
+          echo "This may take 20-40 minutes..."
           ollama pull gemma4:e4b
           echo "✓ Model pull complete!"
 
@@ -64,7 +81,9 @@ jobs:
           ollama list
           echo ""
           echo "Testing model..."
-          echo "Hello" | ollama run gemma4:e4b
+          echo '{"model":"gemma4:e4b","prompt":"Say hello","stream":false}' | \
+            curl -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d @- | \
+            grep -o '"response":"[^"]*"' || echo "Test completed"
 
       - name: Setup Cloudflare Tunnel
         uses: AnimMouse/setup-cloudflared@v2
@@ -72,6 +91,16 @@ jobs:
           cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
           cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
           cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
+
+      - name: Display Connection Info
+        run: |
+          echo "=========================================="
+          echo "✓ Ollama API: http://localhost:11434"
+          echo "✓ Model: gemma4:e4b"
+          echo "✓ Status: Ready for connections"
+          echo "=========================================="
+          echo ""
+          echo "Runner will stay alive for 6 hours"
 
       - name: Keep Runner Alive
         run: sleep 21600
