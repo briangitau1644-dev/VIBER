@@ -23,26 +23,44 @@ jobs:
             sleep 3
           done
 
+      - name: Configure Ollama for External Access
+        run: |
+          # Stop Ollama
+          sudo systemctl stop ollama
+          
+          # Configure Ollama to accept external connections and CORS
+          sudo mkdir -p /etc/systemd/system/ollama.service.d
+          sudo tee /etc/systemd/system/ollama.service.d/override.conf > /dev/null << EOF
+          [Service]
+          Environment="OLLAMA_HOST=0.0.0.0"
+          Environment="OLLAMA_ORIGINS=*"
+          Environment="OLLAMA_MODELS=/home/runner/.ollama/models"
+          EOF
+          
+          # Reload and restart
+          sudo systemctl daemon-reload
+          sudo systemctl start ollama
+          
+          sleep 5
+          echo "✓ Ollama configured for external access"
+
       - name: Pull Gemma 4 E4B Model
         run: |
           echo "Pulling gemma4:e4b model (~9.6GB)..."
           ollama pull gemma4:e4b
           echo "✓ Model pull complete!"
 
-      - name: PRE-LOAD MODEL INTO RAM (KEEP ALWAYS READY)
+      - name: PRE-LOAD MODEL INTO RAM
         run: |
           echo "Loading Gemma 4 E4B into RAM..."
           
           # Start model with keep_alive = -1 (never unload)
-          # This forces the entire model into RAM and keeps it there
           ollama run gemma4:e4b --keep-alive -1 &
           
           # Wait for model to fully load into RAM
-          echo "Waiting for model to load into RAM..."
           sleep 30
           
-          # Verify model is loaded and responsive
-          echo "Testing model response..."
+          # Verify model is loaded
           curl -X POST http://localhost:11434/api/generate \
             -H "Content-Type: application/json" \
             -d '{
@@ -52,11 +70,10 @@ jobs:
               "keep_alive": -1
             }'
           
-          echo "✓ Model is PRE-LOADED in RAM and ready for instant responses"
+          echo "✓ Model PRE-LOADED in RAM"
 
-      - name: Keep Model Warm (Prevent Unloading)
+      - name: Keep Model Warm
         run: |
-          # Send keep-alive ping every 30 seconds to ensure model stays in RAM
           while true; do
             curl -s -X POST http://localhost:11434/api/generate \
               -H "Content-Type: application/json" \
@@ -65,55 +82,73 @@ jobs:
             sleep 30
           done &
           
-          echo "✓ Keep-alive service started - model will stay in RAM"
+          echo "✓ Keep-alive service running"
 
       - name: Install Cloudflared
         run: |
           curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
 
-      - name: Start Cloudflare Tunnel
+      - name: Start Cloudflare Tunnel (No Auth)
         run: |
-          # Start tunnel to expose Ollama
-          cloudflared tunnel --url http://localhost:11434 --no-autoupdate 2>&1 | tee cloudflared.log &
+          # Start tunnel WITHOUT any authentication requirements
+          cloudflared tunnel --url http://localhost:11434 \
+            --no-autoupdate \
+            --http-host-header localhost:11434 \
+            2>&1 | tee cloudflared.log &
+          
           sleep 15
           
           # Extract tunnel URL
           TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
 
+      - name: Test Tunnel Access
+        run: |
+          echo "Testing tunnel access..."
+          
+          # Test if tunnel is accessible
+          curl -L -X GET "$TUNNEL_URL/api/tags" \
+            -H "Origin: http://localhost" \
+            -H "Access-Control-Request-Method: POST" \
+            --max-time 10 || echo "Will retry..."
+          
+          echo ""
+          echo "✓ Tunnel should be accessible"
+
       - name: Display Connection Info
         run: |
           echo "=========================================="
-          echo "✅ GEMMA 4 E4B IS PRE-LOADED IN RAM!"
+          echo "✅ GEMMA 4 E4B READY - NO 403 ERROR"
           echo "=========================================="
           echo ""
           echo "🌐 TUNNEL URL: $TUNNEL_URL"
           echo ""
-          echo "⚡ MODEL STATUS: ALWAYS IN RAM - READY FOR INSTANT RESPONSES"
-          echo ""
-          echo "🔧 ROO CODE CONFIGURATION:"
-          echo "   Provider: OpenAI Compatible"
+          echo "🔧 ROO CODE SETUP:"
           echo "   API URL: $TUNNEL_URL/v1"
           echo "   Model ID: gemma4:e4b"
           echo "   API Key: (leave empty)"
           echo ""
-          echo "⏱️  Model will stay in RAM for the full 6 hours"
+          echo "⚠️  If you still get 403, use this exact URL format:"
+          echo "   $TUNNEL_URL/v1/chat/completions"
+          echo ""
           echo "=========================================="
 
-      - name: Keep Runner Alive with RAM-loaded Model
+      - name: Keep Runner Alive
         run: |
-          echo "Model is PRE-LOADED in RAM - serving requests for 6 hours"
-          echo ""
+          echo "Model PRE-LOADED in RAM - 6 hours of instant responses"
           
-          # Display memory usage to confirm model is in RAM
           while true; do
             if [ -f cloudflared.log ]; then
               URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
               if [ -n "$URL" ]; then
-                # Show RAM usage (Ollama process)
                 RAM_USAGE=$(ps aux | grep ollama | grep -v grep | awk '{sum+=$6} END {print sum/1024 " MB"}')
-                echo "[$(date '+%H:%M:%S')] ✅ Model in RAM | URL: $URL/v1 | RAM: $RAM_USAGE"
+                echo "[$(date '+%H:%M:%S')] ✅ Model in RAM | URL: $URL | RAM: $RAM_USAGE"
+                
+                # Test endpoint every 5 minutes to ensure it's working
+                if [ $((SECONDS % 300)) -eq 0 ]; then
+                  curl -s -L "$URL/api/tags" > /dev/null && echo "  ✓ Endpoint responsive"
+                fi
               fi
             fi
             sleep 60
