@@ -9,20 +9,27 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Setup Ollama
-        uses: ai-action/setup-ollama@v2
-        with:
-          version: 'latest'
-
-      - name: Pull Gemma 4 E4B
+      - name: Install Ollama (Manual)
         run: |
+          # Download and install Ollama binary directly
+          curl -L https://ollama.com -o /usr/local/bin/ollama
+          sudo chmod +x /usr/local/bin/ollama
+          
+          # Start Ollama service in the background
+          ollama serve &
+          
+          # Wait for the API to be ready
           echo "Waiting for Ollama to be ready..."
           until curl -s http://localhost:11434/api/tags > /dev/null; do
             sleep 2
           done
-          
-          echo "Pulling Gemma 4 E4B..."
-          # Model tag corrected to the official library format
+          echo "Ollama is active!"
+
+      - name: Pull Gemma 4 E4B
+        run: |
+          echo "Pulling Gemma4:e4b..."
+          # This model is ~9.6GB. GitHub runners have 7GB RAM.
+          # It will pull, but may run slowly on swap memory.
           ollama pull gemma4:e4b
 
       - name: Setup Cloudflare Tunnel
@@ -30,7 +37,9 @@ jobs:
         with:
           cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
           cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
+          # Ensure your config.yaml points to http://localhost:11434
           cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
 
       - name: Keep Runner Alive
+        # Keeps the tunnel open for 6 hours (max GitHub limit)
         run: sleep 21600 
