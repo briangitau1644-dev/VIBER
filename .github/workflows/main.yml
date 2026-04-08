@@ -1,64 +1,18 @@
-name: Host Gemma 4 E4B for Roo Code
-on:
-  workflow_dispatch:
-
-jobs:
-  host-gemma:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Install Ollama (Manual)
+      - name: Install Ollama (Alternative - Direct Binary)
         run: |
-          # Download Ollama Linux binary from official releases
-          sudo curl -L https://github.com/ollama/ollama/releases/download/v0.3.14/ollama-linux-amd64 -o /usr/local/bin/ollama
-          sudo chmod +x /usr/local/bin/ollama
+          # Download with follow-redirects
+          curl -L -o ollama-linux-amd64 https://github.com/ollama/ollama/releases/latest/download/ollama-linux-amd64
+          sudo install -o root -g root -m 0755 ollama-linux-amd64 /usr/local/bin/ollama
           
-          # Create ollama user and data directory
-          sudo useradd -r -s /bin/false -m -d /usr/share/ollama ollama || true
-          sudo mkdir -p /usr/share/ollama
-          sudo chown -R ollama:ollama /usr/share/ollama
+          # Start Ollama
+          ollama serve &
           
-          # Start Ollama service in the background
-          sudo -u ollama ollama serve &
-          
-          # Wait for the API to be ready
-          echo "Waiting for Ollama to be ready..."
-          for i in {1..30}; do
+          sleep 5
+          for i in {1..20}; do
             if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "Ollama is active!"
+              echo "✓ Ollama is active!"
               break
             fi
-            echo "Attempt $i/30 - Ollama not ready yet, waiting..."
-            sleep 2
+            echo "Waiting for Ollama... (attempt $i/20)"
+            sleep 3
           done
-
-      - name: Pull Gemma 4 E4B
-        run: |
-          echo "Pulling gemma4:e4b model..."
-          echo "Note: This model is ~9.6GB and may take 10-20 minutes to download"
-          ollama pull gemma4:e4b
-          echo "Model pull complete!"
-
-      - name: Verify Model is Loaded
-        run: |
-          echo "Checking available models:"
-          ollama list
-          echo "Testing model with simple prompt:"
-          echo "Hello, are you working?" | ollama run gemma4:e4b
-
-      - name: Setup Cloudflare Tunnel
-        uses: AnimMouse/setup-cloudflared@v2
-        with:
-          cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
-          cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
-          cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
-
-      - name: Keep Runner Alive
-        # Keeps the tunnel open for 6 hours (max GitHub limit)
-        run: |
-          echo "Runner will stay alive for 6 hours"
-          echo "Cloudflare tunnel is exposing Ollama API at http://localhost:11434"
-          echo "Press Ctrl+C to stop early if needed"
-          sleep 21600
