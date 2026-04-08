@@ -1,0 +1,27 @@
+name: Host Gemma 4B
+on:
+  workflow_dispatch: # Allows manual start
+
+jobs:
+  host-gemma:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com | sh
+
+      - name: Start Ollama and Pull Gemma
+        run: |
+          ollama serve & 
+          sleep 10
+          ollama pull gemma:4b
+
+      - name: Setup Cloudflare Tunnel
+        uses: AnimMouse/setup-cloudflared@v2
+        with:
+          cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
+          cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
+          # The config.yaml must point to http://localhost:11434
+          cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
+
+      - name: Keep Alive
+        run: sleep 21600 # Keeps the runner active for 6 hours
