@@ -9,7 +9,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Ollama (Official Method)
+      - name: Install Ollama
         run: |
           # Install Ollama using official script
           curl -fsSL https://ollama.com/install.sh | sh
@@ -44,76 +44,108 @@ jobs:
           
           echo "✓ Model pull complete!"
 
-      - name: Run Gemma 4 E4B Model
+      - name: Start Gemma 4 E4B Model
         run: |
           echo "Starting gemma4:e4b model..."
           
-          # Start the model and keep it running
-          ollama run gemma4:e4b --keep-alive 6h &
+          # Keep model loaded in memory
+          ollama run gemma4:e4b &
           
-          # Wait for model to load into memory
+          # Wait for model to load
           sleep 10
           
           # Test the model
           echo "Testing model with simple prompt..."
-          echo '{"model":"gemma4:e4b","prompt":"Say ready in one word","stream":false}' | \
-            curl -X POST http://localhost:11434/api/generate \
+          RESPONSE=$(curl -s -X POST http://localhost:11434/api/generate \
             -H "Content-Type: application/json" \
-            -d @- | \
-            python3 -c "import sys, json; print('Response:', json.load(sys.stdin).get('response', 'N/A'))"
+            -d '{"model":"gemma4:e4b","prompt":"Say ready in one word","stream":false}')
           
+          echo "Response: $RESPONSE"
           echo "✓ Model is running and ready for requests"
 
-      - name: Verify Model Status
+      - name: Install Cloudflared
+        run: |
+          # Install cloudflared directly
+          echo "Installing Cloudflared..."
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          cloudflared --version
+          echo "✓ Cloudflared installed"
+
+      - name: Start Cloudflare Tunnel (Quick Tunnel)
         run: |
           echo "=========================================="
-          echo "Model Status:"
+          echo "Starting Cloudflare tunnel..."
           echo "=========================================="
-          ollama list
-          echo ""
-          echo "Running processes:"
-          ps aux | grep ollama | grep -v grep || echo "No ollama process found"
+          
+          # Start tunnel in background and capture output
+          cloudflared tunnel --url http://localhost:11434 --no-autoupdate 2>&1 | tee cloudflared.log &
+          
+          # Wait for tunnel to establish
+          echo "Waiting for tunnel to be ready..."
+          sleep 15
+          
+          # Extract tunnel URL from logs
+          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
+          
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "✓ Tunnel is active!"
+            echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            echo "✓ Tunnel URL: $TUNNEL_URL"
+          else
+            echo "⚠️ Could not extract tunnel URL automatically"
+            echo "Check the logs above for the tunnel URL"
+          fi
 
-      - name: Setup Cloudflare Tunnel
-        uses: AnimMouse/setup-cloudflared@v2
-        with:
-          cloudflare_tunnel_credential: ${{ secrets.CLOUDFLARE_TUNNEL_CREDENTIAL }}
-          cloudflare_tunnel_id: ${{ vars.CLOUDFLARE_TUNNEL_ID }}
-          cloudflare_tunnel_configuration: ${{ vars.CLOUDFLARE_TUNNEL_CONFIGURATION }}
-
-      - name: Display API Information
+      - name: Display Connection Info
         run: |
           echo "=========================================="
-          echo "✓ Ollama API: http://localhost:11434"
-          echo "✓ Model: gemma4:e4b"
-          echo "✓ Status: Running"
-          echo ""
-          echo "API Endpoints:"
-          echo "  - Generate: POST /api/generate"
-          echo "  - Chat: POST /api/chat"
-          echo "  - List Models: GET /api/tags"
-          echo ""
-          echo "OpenAI Compatible Endpoint:"
-          echo "  - http://localhost:11434/v1/chat/completions"
-          echo ""
-          echo "To use with Roo Code:"
-          echo "  1. Set API URL to your Cloudflare tunnel URL"
-          echo "  2. Add /v1/chat/completions to the end"
-          echo "  3. Model name: gemma4:e4b"
-          echo "  4. API format: OpenAI Compatible"
-          echo ""
-          echo "Example curl command:"
-          echo "  curl -X POST http://localhost:11434/api/generate \\"
-          echo "    -H 'Content-Type: application/json' \\"
-          echo "    -d '{\"model\":\"gemma4:e4b\",\"prompt\":\"Hello\"}'"
+          echo "✅ GEMMA 4 E4B IS READY FOR ROO CODE!"
           echo "=========================================="
           echo ""
-          echo "Runner will stay alive for 6 hours"
-          echo "Press Ctrl+C to stop early"
+          echo "📡 Local API: http://localhost:11434"
+          echo "🤖 Model: gemma4:e4b"
+          echo ""
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "🌐 CLOUDFLARE TUNNEL URL:"
+            echo "   $TUNNEL_URL"
+            echo ""
+            echo "🔧 ROO CODE CONFIGURATION:"
+            echo "   1. API URL: $TUNNEL_URL/v1/chat/completions"
+            echo "   2. Model name: gemma4:e4b"
+            echo "   3. API format: OpenAI Compatible"
+          else
+            echo "🔍 Check the workflow logs above for the tunnel URL"
+            echo "   Look for: https://xxxxx.trycloudflare.com"
+          fi
+          echo ""
+          echo "🧪 TEST COMMAND:"
+          echo "   curl -X POST http://localhost:11434/v1/chat/completions \\"
+          echo "     -H 'Content-Type: application/json' \\"
+          echo "     -d '{\"model\":\"gemma4:e4b\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+          echo ""
+          echo "⏱️  Runner will stay alive for 6 hours"
+          echo "=========================================="
 
       - name: Keep Runner Alive
-        # Keeps the tunnel and model running for 6 hours (max GitHub limit)
         run: |
+          echo "=========================================="
+          echo "✅ Service is running!"
+          echo "✅ Model: gemma4:e4b loaded"
+          echo "✅ Tunnel: Active"
+          echo "=========================================="
+          echo ""
           echo "Keeping runner alive for 6 hours..."
-          echo "gemma4:e4b is ready to accept requests via Cloudflare tunnel"
-          sleep 21600
+          echo "Press Ctrl+C to stop early"
+          echo ""
+          
+          # Display tunnel URL every minute
+          while true; do
+            if [ -f cloudflared.log ]; then
+              TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
+              if [ -n "$TUNNEL_URL" ]; then
+                echo "[$(date '+%H:%M:%S')] Tunnel active at: $TUNNEL_URL"
+              fi
+            fi
+            sleep 60
+          done
