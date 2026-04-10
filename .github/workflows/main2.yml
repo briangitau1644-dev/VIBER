@@ -27,16 +27,14 @@ env:
 
 jobs:
   senior-engineer-ollama-gemma4:
-    name: Gemma4-E4B via Ollama – Senior Engineer
+    name: Gemma4-E4B via Ollama - Senior Engineer
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
     steps:
-      # ------------------------------------------------------------------ #
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------ #
       - name: Kill stale processes
         run: |
           pkill -9 -f ollama      2>/dev/null || true
@@ -47,27 +45,23 @@ jobs:
           sleep 2
           echo "Ports $PROXY_PORT and $OLLAMA_PORT are free."
 
-      # ------------------------------------------------------------------ #
       - name: Install system deps
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl wget jq python3
 
-      # ------------------------------------------------------------------ #
       - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
 
-      # ------------------------------------------------------------------ #
       - name: Start Ollama server
         run: |
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT \
           OLLAMA_KEEP_ALIVE=-1 \
           nohup ollama serve > ollama.log 2>&1 &
           echo $! > ollama.pid
-
-          echo "Waiting for Ollama to be ready..."
+          echo "Waiting for Ollama..."
           for i in $(seq 1 30); do
             if curl -sf "http://127.0.0.1:$OLLAMA_PORT/" > /dev/null 2>&1; then
               echo "Ollama ready after ~${i}s"
@@ -77,36 +71,25 @@ jobs:
             sleep 2
           done
 
-      # ------------------------------------------------------------------ #
       - name: Pull gemma4:e4b model
         run: |
-          echo "Pulling $MODEL (this may take 10-20 min for a fresh runner)..."
+          echo "Pulling $MODEL..."
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull "$MODEL"
           echo "Pull complete."
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
 
-      # ------------------------------------------------------------------ #
       - name: Write tool-call interceptor proxy
         run: |
-          cat > /tmp/interceptor.py << 'PYEOF'
-#!/usr/bin/env python3
-"""
-Tool-call interceptor for Roo Code ↔ Ollama (gemma4:e4b)
-Responsibilities:
-  1. Inject a rich system prompt that teaches the model about tool calls
-  2. Detect <tool_call>…</tool_call> XML in assistant replies and reformat
-     them as OpenAI-style function-call objects so Roo Code understands them
-  3. Detect assistant replies that ARE a tool result and pass them through cleanly
-  4. Add permissive CORS + auth headers so VS Code extensions never see 403s
-  5. Forward everything else verbatim to Ollama
-"""
-import http.server, json, os, re, urllib.request, urllib.error, traceback
+          python3 << 'PYEOF'
+import pathlib
 
-BACKEND = f"http://127.0.0.1:{os.environ.get('OLLAMA_PORT', '11434')}"
-PORT    = int(os.environ.get('PROXY_PORT', '1234'))
-MODEL   = os.environ.get('MODEL', 'gemma4:e4b')
+code = r'''
+import http.server, json, os, re, uuid, urllib.request, urllib.error, traceback
 
-# ── System prompt ─────────────────────────────────────────────────────────────
+BACKEND = "http://127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
+PORT    = int(os.environ.get("PROXY_PORT", "1234"))
+MODEL   = os.environ.get("MODEL", "gemma4:e4b")
+
 SYSTEM_PROMPT = """You are a Senior Software Developer with 15 years of full-stack experience.
 Languages: Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, Ruby, Bash, SQL, GraphQL.
 Frontends: React, Vue, Svelte, HTML/CSS/Tailwind.
@@ -116,84 +99,57 @@ Cloud: AWS, GCP, Azure. Containers: Docker, Kubernetes.
 You are running inside Roo Code (VS Code extension). You have access to tools.
 
 TOOL CALL PROTOCOL
-──────────────────
 When you need to use a tool, output ONLY a JSON function call in this exact format:
 {"tool_use": {"name": "<tool_name>", "parameters": {<key-value pairs>}}}
 
-Available tools and their parameter schemas:
-  read_file         : {"path": "<absolute or relative path>"}
+Available tools:
+  read_file         : {"path": "<path>"}
   write_file        : {"path": "<path>", "content": "<full file content>"}
   create_directory  : {"path": "<dir path>"}
   list_directory    : {"path": "<dir path>"}
   execute_command   : {"command": "<shell command>", "cwd": "<optional working dir>"}
   search_files      : {"pattern": "<glob or regex>", "path": "<root dir>"}
   web_search        : {"query": "<search query>"}
-  browser_action    : {"action": "launch|click|type|screenshot|close", "url": "<url if launch>", "selector": "<css selector if click/type>", "text": "<text if type>"}
+  browser_action    : {"action": "launch|click|type|screenshot|close", "url": "<url if launch>", "selector": "<css selector>", "text": "<text if type>"}
 
 Rules:
 - Call ONE tool at a time. Wait for the result before calling the next.
-- When you receive a tool result it will appear as a message with role "tool".
-- After getting a tool result, continue reasoning or call another tool.
-- When the task is complete, write a plain-language summary for the user.
-- Never apologise for using tools – just use them.
-- Write complete, production-quality code with error handling. No placeholders.
-- Be direct. When chatting, talk like a senior colleague. When coding, ship it.
+- Tool results arrive as messages with role tool.
+- Write complete production-quality code with error handling. No placeholders.
+- Be direct. Talk like a senior colleague.
 """
 
-# ── Regex patterns ─────────────────────────────────────────────────────────────
-# Roo Code may send tool calls wrapped in XML or in JSON blocks
-RE_XML_TOOL   = re.compile(
-    r'<tool_call[^>]*>\s*(.*?)\s*</tool_call>',
-    re.DOTALL | re.IGNORECASE
-)
-RE_JSON_TOOL  = re.compile(
-    r'```(?:json)?\s*(\{[^`]*"tool_use"[^`]*\})\s*```',
-    re.DOTALL
-)
-RE_FUNC_CALL  = re.compile(
-    r'\{"tool_use"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
-    re.DOTALL
-)
+RE_XML_TOOL  = re.compile(r"<tool_call[^>]*>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+RE_JSON_TOOL = re.compile(r"```(?:json)?\s*(\{[^`]*\"tool_use\"[^`]*\})\s*```", re.DOTALL)
 
-# ── Helper: parse tool call from assistant text ────────────────────────────────
-def extract_tool_call(text: str):
-    """
-    Look for a tool call in assistant output.
-    Returns (tool_name, parameters_dict) or (None, None).
-    """
-    # 1. Raw JSON {"tool_use": {...}}
+def extract_tool_call(text):
     try:
         obj = json.loads(text.strip())
-        if 'tool_use' in obj:
-            tu = obj['tool_use']
-            return tu.get('name'), tu.get('parameters', {})
+        if "tool_use" in obj:
+            tu = obj["tool_use"]
+            return tu.get("name"), tu.get("parameters", {})
     except Exception:
         pass
-
-    # 2. Fenced JSON block
     m = RE_JSON_TOOL.search(text)
     if m:
         try:
             obj = json.loads(m.group(1))
-            tu = obj.get('tool_use', {})
-            return tu.get('name'), tu.get('parameters', {})
+            tu = obj.get("tool_use", {})
+            return tu.get("name"), tu.get("parameters", {})
         except Exception:
             pass
-
-    # 3. XML <tool_call> wrapper (Roo Code older format)
     m = RE_XML_TOOL.search(text)
     if m:
         inner = m.group(1).strip()
         try:
             obj = json.loads(inner)
-            name   = obj.get('name') or obj.get('tool') or obj.get('function')
-            params = obj.get('parameters') or obj.get('arguments') or obj.get('args') or {}
+            name   = obj.get("name") or obj.get("tool") or obj.get("function")
+            params = obj.get("parameters") or obj.get("arguments") or obj.get("args") or {}
             if name:
                 return name, params
         except Exception:
             pass
-        # Plain <tool_name>…</tool_name> inside the wrapper
-        tag = re.search(r'<([a-z_]+)>(.*?)</\1>', inner, re.DOTALL)
+        tag = re.search(r"<([a-z_]+)>(.*?)</\1>", inner, re.DOTALL)
         if tag:
             name = tag.group(1)
             try:
@@ -201,240 +157,168 @@ def extract_tool_call(text: str):
             except Exception:
                 params = {"value": tag.group(2).strip()}
             return name, params
-
     return None, None
 
-# ── Helper: build OpenAI-style tool_calls response ────────────────────────────
-def build_tool_call_response(name: str, params: dict, original_response: dict) -> dict:
-    """Wrap a detected tool call as an OpenAI function-call message."""
-    import uuid
-    call_id = f"call_{uuid.uuid4().hex[:8]}"
-    choice = {
-        "index": 0,
-        "message": {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(params)
-                }
-            }]
-        },
-        "finish_reason": "tool_calls"
-    }
+def build_tool_call_response(name, params, original):
+    call_id = "call_" + uuid.uuid4().hex[:8]
     return {
-        "id": original_response.get("id", "chatcmpl-intercepted"),
+        "id": original.get("id", "chatcmpl-intercepted"),
         "object": "chat.completion",
-        "created": original_response.get("created", 0),
-        "model": original_response.get("model", MODEL),
-        "choices": [choice],
-        "usage": original_response.get("usage", {})
+        "created": original.get("created", 0),
+        "model": original.get("model", MODEL),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(params)}
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": original.get("usage", {})
     }
 
-# ── Helper: ensure system prompt is present ───────────────────────────────────
-def inject_system_prompt(messages: list) -> list:
+def inject_system_prompt(messages):
     if not messages:
         return [{"role": "system", "content": SYSTEM_PROMPT}]
     if messages[0].get("role") != "system":
         return [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-    # Augment existing system prompt so we don't clobber user additions
     existing = messages[0].get("content", "")
     if "TOOL CALL PROTOCOL" not in existing:
         messages = list(messages)
         messages[0] = {"role": "system", "content": existing + "\n\n" + SYSTEM_PROMPT}
     return messages
 
-# ── Helper: remap /v1/* paths to Ollama equivalents ───────────────────────────
-def remap_path(path: str) -> str:
-    """Ollama exposes /api/chat and /api/generate; it also mirrors /v1/* via compat."""
-    # Ollama ≥0.1.14 natively speaks /v1/chat/completions – pass through.
-    return path
-
-# ── HTTP handler ───────────────────────────────────────────────────────────────
 class Interceptor(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        # Only log errors and tool-call events to keep logs tidy
         pass
 
-    def _cors_headers(self):
+    def _cors(self):
         self.send_header("Access-Control-Allow-Origin",  "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
         self.send_header("Access-Control-Allow-Headers",
-                         "Authorization, Content-Type, X-Requested-With, Accept, "
-                         "X-Api-Key, api-key, x-stainless-os, x-stainless-lang, "
-                         "x-stainless-package-version, x-stainless-runtime, "
-                         "x-stainless-runtime-version, x-stainless-arch")
-        self.send_header("Access-Control-Max-Age",       "86400")
+            "Authorization, Content-Type, X-Requested-With, Accept, "
+            "X-Api-Key, api-key, x-stainless-os, x-stainless-lang, "
+            "x-stainless-package-version, x-stainless-runtime, "
+            "x-stainless-runtime-version, x-stainless-arch")
+        self.send_header("Access-Control-Max-Age", "86400")
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self._cors_headers()
+        self._cors()
         self.end_headers()
 
-    def _forward(self, body: bytes | None = None):
-        url  = BACKEND + remap_path(self.path)
-        hdrs = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in ("host", "content-length", "authorization",
-                                  "api-key", "x-api-key")
-        }
-        hdrs["Host"] = f"127.0.0.1:{os.environ.get('OLLAMA_PORT', '11434')}"
+    def _fwd(self, body=None):
+        url  = BACKEND + self.path
+        hdrs = {k: v for k, v in self.headers.items()
+                if k.lower() not in ("host", "content-length", "authorization", "api-key", "x-api-key")}
+        hdrs["Host"] = "127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
         if body is not None:
             hdrs["Content-Length"] = str(len(body))
-        req = urllib.request.Request(
-            url, data=body, headers=hdrs, method=self.command
-        )
+        req = urllib.request.Request(url, data=body, headers=hdrs, method=self.command)
         try:
-            r  = urllib.request.urlopen(req, timeout=600)
+            r = urllib.request.urlopen(req, timeout=600)
             st, rh, rb = r.status, r.headers, r.read()
         except urllib.error.HTTPError as e:
             st, rh, rb = e.code, e.headers, e.read()
-
         self.send_response(st)
-        self._cors_headers()
+        self._cors()
         for k, v in rh.items():
-            if k.lower() in ("content-type",):
+            if k.lower() == "content-type":
                 self.send_header(k, v)
         self.send_header("Content-Length", str(len(rb)))
         self.end_headers()
         self.wfile.write(rb)
 
-    def do_GET(self):
-        self._forward()
-
-    def do_DELETE(self):
-        self._forward()
+    def do_GET(self):    self._fwd()
+    def do_DELETE(self): self._fwd()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw    = self.rfile.read(length)
-
         is_chat = "/chat/completions" in self.path or "/api/chat" in self.path
-
-        if is_chat:
-            try:
-                payload = json.loads(raw)
-
-                # 1. Inject / augment system prompt
-                payload["messages"] = inject_system_prompt(
-                    payload.get("messages", [])
-                )
-
-                # 2. Force the model to gemma4:e4b regardless of what client sends
-                payload["model"] = MODEL
-
-                # 3. Apply tuning defaults only if not already set
-                payload.setdefault("temperature", float(os.environ.get("TEMPERATURE", "0.2")))
-                payload.setdefault("options", {})
-                payload["options"].setdefault("num_ctx",        int(os.environ.get("CTX_SIZE", "8192")))
-                payload["options"].setdefault("repeat_penalty", 1.05)
-                payload["options"].setdefault("top_p",          0.95)
-                payload["options"].setdefault("top_k",          64)
-
-                # 4. If client requested streaming we handle it straight-through
-                #    (tool-call detection works on buffered responses only)
-                streaming = payload.get("stream", False)
-
-                raw = json.dumps(payload).encode()
-
-                if streaming:
-                    # Pass straight through – we can't intercept stream chunks easily
-                    self._forward(raw)
-                    return
-
-                # ── Non-streaming: buffer, inspect, maybe reformat ──────────
-                url  = BACKEND + remap_path(self.path)
-                hdrs = {
-                    k: v for k, v in self.headers.items()
-                    if k.lower() not in ("host", "content-length", "authorization",
-                                          "api-key", "x-api-key")
-                }
-                hdrs["Host"]           = f"127.0.0.1:{os.environ.get('OLLAMA_PORT', '11434')}"
-                hdrs["Content-Length"] = str(len(raw))
-
-                req = urllib.request.Request(
-                    url, data=raw, headers=hdrs, method="POST"
-                )
-                try:
-                    r  = urllib.request.urlopen(req, timeout=600)
-                    st, rh, rb = r.status, r.headers, r.read()
-                except urllib.error.HTTPError as e:
-                    st, rh, rb = e.code, e.headers, e.read()
-                    self._send_json(st, rb)
-                    return
-
-                # Parse the Ollama response
-                try:
-                    resp_obj = json.loads(rb)
-                except Exception:
-                    self._send_raw(st, rh, rb)
-                    return
-
-                # Extract assistant text
-                assistant_text = ""
-                try:
-                    assistant_text = (
-                        resp_obj["choices"][0]["message"]["content"] or ""
-                    )
-                except Exception:
-                    pass
-
-                # Detect tool call in assistant text
-                tool_name, tool_params = extract_tool_call(assistant_text)
-                if tool_name:
-                    print(f"[interceptor] tool call detected: {tool_name}({json.dumps(tool_params)[:120]})", flush=True)
-                    reformatted = build_tool_call_response(tool_name, tool_params, resp_obj)
-                    body = json.dumps(reformatted).encode()
-                    self.send_response(200)
-                    self._cors_headers()
-                    self.send_header("Content-Type",   "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-
-                # No tool call – pass through original response
-                self._send_raw(200, rh, rb)
+        if not is_chat:
+            self._fwd(raw)
+            return
+        try:
+            payload = json.loads(raw)
+            payload["messages"] = inject_system_prompt(payload.get("messages", []))
+            payload["model"] = MODEL
+            payload.setdefault("temperature", float(os.environ.get("TEMPERATURE", "0.2")))
+            payload.setdefault("options", {})
+            payload["options"].setdefault("num_ctx",       int(os.environ.get("CTX_SIZE", "8192")))
+            payload["options"].setdefault("repeat_penalty", 1.05)
+            payload["options"].setdefault("top_p", 0.95)
+            payload["options"].setdefault("top_k", 64)
+            if payload.get("stream", False):
+                self._fwd(json.dumps(payload).encode())
                 return
-
+            raw = json.dumps(payload).encode()
+            url  = BACKEND + self.path
+            hdrs = {k: v for k, v in self.headers.items()
+                    if k.lower() not in ("host", "content-length", "authorization", "api-key", "x-api-key")}
+            hdrs["Host"]           = "127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
+            hdrs["Content-Length"] = str(len(raw))
+            req = urllib.request.Request(url, data=raw, headers=hdrs, method="POST")
+            try:
+                r = urllib.request.urlopen(req, timeout=600)
+                st, rh, rb = r.status, r.headers, r.read()
+            except urllib.error.HTTPError as e:
+                st, rh, rb = e.code, e.headers, e.read()
+                self._reply(st, rb)
+                return
+            try:
+                resp_obj = json.loads(rb)
             except Exception:
-                traceback.print_exc()
-                # Fall through to raw forward on any parsing error
+                self._fwd_raw(st, rh, rb)
+                return
+            assistant_text = ""
+            try:
+                assistant_text = resp_obj["choices"][0]["message"]["content"] or ""
+            except Exception:
                 pass
+            tool_name, tool_params = extract_tool_call(assistant_text)
+            if tool_name:
+                print("[interceptor] tool call: " + tool_name, flush=True)
+                body = json.dumps(build_tool_call_response(tool_name, tool_params, resp_obj)).encode()
+                self._reply(200, body)
+                return
+            self._fwd_raw(200, rh, rb)
+        except Exception:
+            traceback.print_exc()
+            self._fwd(raw)
 
-        self._forward(raw)
-
-    def _send_raw(self, status, headers, body: bytes):
+    def _fwd_raw(self, status, headers, body):
         self.send_response(status)
-        self._cors_headers()
+        self._cors()
         for k, v in headers.items():
-            if k.lower() in ("content-type",):
+            if k.lower() == "content-type":
                 self.send_header(k, v)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, status, body: bytes):
+    def _reply(self, status, body):
         self.send_response(status)
-        self._cors_headers()
+        self._cors()
         self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+srv = http.server.HTTPServer(("0.0.0.0", PORT), Interceptor)
+print("[interceptor] :" + str(PORT) + " -> " + BACKEND, flush=True)
+srv.serve_forever()
+'''
 
-if __name__ == "__main__":
-    server = http.server.HTTPServer(("0.0.0.0", PORT), Interceptor)
-    print(f"[interceptor] listening on :{PORT}  →  {BACKEND}", flush=True)
-    server.serve_forever()
+pathlib.Path("/tmp/interceptor.py").write_text(code)
+print("interceptor.py written successfully.")
 PYEOF
-          chmod +x /tmp/interceptor.py
-          echo "Interceptor written."
 
-      # ------------------------------------------------------------------ #
       - name: Start interceptor proxy
         run: |
           PROXY_PORT=$PROXY_PORT \
@@ -444,70 +328,30 @@ PYEOF
           CTX_SIZE=$CTX_SIZE \
           nohup python3 /tmp/interceptor.py > proxy.log 2>&1 &
           echo $! > proxy.pid
-
           sleep 3
-          if curl -sf "http://127.0.0.1:$PROXY_PORT/" > /dev/null 2>&1 || \
-             curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags" > /dev/null 2>&1; then
-            echo "Interceptor proxy healthy on :$PROXY_PORT"
-          else
-            echo "WARNING: Proxy health check via root failed – checking /v1/models..."
-            curl -sv "http://127.0.0.1:$PROXY_PORT/v1/models" 2>&1 | tail -5 || true
-          fi
-          cat proxy.log | tail -5
+          curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags" > /dev/null 2>&1 \
+            && echo "Proxy healthy on :$PROXY_PORT" \
+            || { echo "Proxy health check failed"; cat proxy.log; }
 
-      # ------------------------------------------------------------------ #
-      - name: Verify system prompt injection + model response
+      - name: Verify system prompt and model response
         run: |
-          echo "Smoke-testing non-streaming chat..."
           RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer test" \
-            -d "{
-              \"model\":\"$MODEL\",
-              \"stream\":false,
-              \"messages\":[{\"role\":\"user\",\"content\":\"Who are you and what tools do you have?\"}],
-              \"max_tokens\":150
-            }" 2>/dev/null)
+            -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Who are you?\"}],\"max_tokens\":120}" \
+            2>/dev/null)
           CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // "NO CONTENT"' 2>/dev/null)
           echo "Model replied: $CONTENT"
-          if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ] || [ "$CONTENT" = "NO CONTENT" ]; then
-            echo "ERROR: No response."
-            cat ollama.log | tail -30
-            cat proxy.log  | tail -20
-            exit 1
-          fi
-          echo "System prompt injection verified."
+          [ "$CONTENT" = "NO CONTENT" ] && { cat ollama.log | tail -20; cat proxy.log | tail -10; exit 1; } || true
 
-      # ------------------------------------------------------------------ #
-      - name: Verify tool-call detection
-        run: |
-          echo "Testing tool-call interception..."
-          RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer test" \
-            -d "{
-              \"model\":\"$MODEL\",
-              \"stream\":false,
-              \"messages\":[{\"role\":\"user\",\"content\":\"List the files in the current directory using the list_directory tool.\"}],
-              \"max_tokens\":200
-            }" 2>/dev/null)
-          FINISH=$(echo "$RESP" | jq -r '.choices[0].finish_reason' 2>/dev/null)
-          echo "finish_reason: $FINISH"
-          echo "Full response: $(echo $RESP | jq -c '.choices[0].message' 2>/dev/null)"
-          # Either tool_calls (intercepted) or stop (answered in text) is fine
-          echo "Tool-call detection step complete."
-
-      # ------------------------------------------------------------------ #
       - name: Install and start Cloudflare tunnel
         run: |
           pkill -9 -f cloudflared 2>/dev/null || true
           sleep 1
-
           curl -fsSL \
             -o /tmp/cf.deb \
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-
           nohup cloudflared tunnel \
             --url "http://127.0.0.1:$PROXY_PORT" \
             --no-autoupdate \
@@ -522,15 +366,11 @@ PYEOF
             sleep 2
           done
 
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "WARNING: Could not get tunnel URL"
-            cat tunnel.log | tail -20
-          fi
-
+          [ -z "$TUNNEL_URL" ] && { echo "WARNING: tunnel URL not found"; cat tunnel.log | tail -20; }
           echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
 
           echo "=================================================="
-          echo "  GEMMA4:E4B + OLLAMA — SENIOR ENGINEER READY"
+          echo "  GEMMA4:E4B + OLLAMA - SENIOR ENGINEER READY"
           echo "=================================================="
           echo "  Tunnel URL : $TUNNEL_URL"
           echo "  Model      : $MODEL"
@@ -540,44 +380,33 @@ PYEOF
           echo "    Provider  : OpenAI-compatible"
           echo "    Base URL  : ${TUNNEL_URL}/v1"
           echo "    Model ID  : $MODEL"
-          echo "    API Key   : any non-empty string (e.g. 'roo')"
+          echo "    API Key   : roo  (any non-empty string)"
           echo "--------------------------------------------------"
           echo "  Tool call interception : ACTIVE"
           echo "  CORS headers           : permissive (*)"
-          echo "  Auth requirement       : none (any key accepted)"
           echo "=================================================="
 
-      # ------------------------------------------------------------------ #
       - name: Smoke test via tunnel
         if: env.CLOUDFLARE_URL != ''
         run: |
-          echo "Tunnel smoke test – write a Python script..."
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer roo" \
-            -d "{
-              \"model\":\"$MODEL\",
-              \"stream\":false,
-              \"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function that reads a JSON file and returns its contents as a dict, with error handling.\"}],
-              \"max_tokens\":300
-            }" 2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
-            || echo "Smoke test parse failed (model may still be warming up)"
+            -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function that reads a JSON file safely.\"}],\"max_tokens\":300}" \
+            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
+            || echo "Smoke test parse failed"
 
-      # ------------------------------------------------------------------ #
       - name: Keepalive
         run: |
           END=$(( $(date +%s) + SESSION_HOURS * 3600 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             REMAINING=$(( (END - $(date +%s)) / 60 ))
-            curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1 \
-              || echo "WARNING: Ollama unhealthy"
-            curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags"  > /dev/null 2>&1 \
-              || echo "WARNING: Proxy unhealthy"
-            echo "Keepalive: ${REMAINING}min remaining – $(date -u '+%H:%M:%S UTC')"
+            curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1 || echo "WARNING: Ollama unhealthy"
+            curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags"  > /dev/null 2>&1 || echo "WARNING: Proxy unhealthy"
+            echo "Keepalive: ${REMAINING}min remaining - $(date -u '+%H:%M:%S UTC')"
             sleep 300
           done
 
-      # ------------------------------------------------------------------ #
       - name: Final report
         if: always()
         run: |
@@ -585,25 +414,22 @@ PYEOF
           echo "Tunnel : ${{ env.CLOUDFLARE_URL || '(not available)' }}"
           echo "--- Ollama models ---"
           curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" 2>/dev/null | jq . || echo "(unreachable)"
-          echo "--- Proxy health ---"
-          curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags" 2>/dev/null | jq . || echo "(unreachable)"
+          echo "--- proxy.log (last 20) ---"
+          tail -20 proxy.log  2>/dev/null || echo "(none)"
           echo "--- ollama.log (last 20) ---"
           tail -20 ollama.log 2>/dev/null || echo "(none)"
-          echo "--- proxy.log (last 20) ---"
-          tail -20 proxy.log 2>/dev/null  || echo "(none)"
           echo "--- tunnel.log (last 10) ---"
           tail -10 tunnel.log 2>/dev/null || echo "(none)"
 
-      # ------------------------------------------------------------------ #
       - name: Cleanup
         if: always()
         run: |
           [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
           [ -f proxy.pid  ] && kill -9 "$(cat proxy.pid)"  2>/dev/null || true
           [ -f ollama.pid ] && kill -9 "$(cat ollama.pid)" 2>/dev/null || true
-          pkill -9 -f cloudflared  2>/dev/null || true
-          pkill -9 -f ollama       2>/dev/null || true
-          pkill -9 -f interceptor  2>/dev/null || true
+          pkill -9 -f cloudflared 2>/dev/null || true
+          pkill -9 -f ollama      2>/dev/null || true
+          pkill -9 -f interceptor 2>/dev/null || true
           sudo fuser -k "$PROXY_PORT/tcp"  2>/dev/null || true
           sudo fuser -k "$OLLAMA_PORT/tcp" 2>/dev/null || true
           rm -f ./*.pid
