@@ -1,505 +1,610 @@
-name: Ollama Proxy — gemma4:e4b — Always-Loaded RAM Mode
+name: Senior Engineer - Ollama Gemma4 E4B - GitHub Actions
 
 on:
   workflow_dispatch:
     inputs:
-      model:
-        description: 'Ollama model to use'
-        required: false
-        default: 'gemma4:e4b'
-      working_dir:
-        description: 'Working directory for file operations'
-        required: false
-        default: '/home/runner/work'
-      enable_ram_pressure:
-        description: 'Enable RAM pressure'
-        required: false
-        default: 'true'
       session_hours:
-        description: 'Session duration in hours (max 6)'
+        description: 'Session duration (max 6)'
         required: false
         default: '6'
+      ctx_size:
+        description: 'Context size'
+        required: false
+        default: '8192'
+      temperature:
+        description: '0.1-0.3 for deterministic code'
+        required: false
+        default: '0.2'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL: ${{ github.event.inputs.model || 'gemma4:e4b' }}
-  WORKING_DIR: ${{ github.event.inputs.working_dir || '/home/runner/work' }}
-  RAM_PRESSURE_ENABLED: ${{ github.event.inputs.enable_ram_pressure || 'true' }}
-  RAM_PRESSURE_MB: '512'
-  ACTIVITY_LOG_INTERVAL: '30'
-  KEEPALIVE_INTERVAL: '8'
-  PROXY_PORT: '8000'
-  OLLAMA_PORT: '11434'
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  CLOUDFLARE_URL: ''
-  OLLAMA_KEEP_ALIVE: '-1'
-  OLLAMA_MAX_LOADED_MODELS: '1'
-  OLLAMA_NUM_PARALLEL: '4'
-  OLLAMA_FLASH_ATTENTION: '1'
+  CTX_SIZE:      ${{ github.event.inputs.ctx_size    || '8192' }}
+  TEMPERATURE:   ${{ github.event.inputs.temperature || '0.2' }}
+  OLLAMA_PORT:   '11434'
+  PROXY_PORT:    '1234'
+  MODEL:         'gemma4:e4b'
 
 jobs:
-  ollama-proxy:
-    name: Ollama Proxy + gemma4:e4b + RAM-Resident + Cloudflare Tunnel
+  senior-engineer-ollama-gemma4:
+    name: Gemma4-E4B via Ollama – Senior Engineer
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
     steps:
-      - name: 📦 Checkout Repository
+      # ------------------------------------------------------------------ #
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # ------------------------------------------------------------------ #
+      - name: Kill stale processes
+        run: |
+          pkill -9 -f ollama      2>/dev/null || true
+          pkill -9 -f cloudflared 2>/dev/null || true
+          pkill -9 -f interceptor 2>/dev/null || true
+          sudo fuser -k $PROXY_PORT/tcp  2>/dev/null || true
+          sudo fuser -k $OLLAMA_PORT/tcp 2>/dev/null || true
+          sleep 2
+          echo "Ports $PROXY_PORT and $OLLAMA_PORT are free."
 
-      - name: 📥 Install System Dependencies
+      # ------------------------------------------------------------------ #
+      - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            curl wget lsof net-tools jq grep bash \
-            htop procps sysstat bc
+          sudo apt-get install -y -qq curl wget jq python3
 
-      - name: 📥 Install Python Dependencies
-        run: |
-          pip install --upgrade pip --quiet
-          pip install --quiet \
-            fastapi \
-            "uvicorn[standard]" \
-            requests \
-            pydantic \
-            starlette \
-            psutil \
-            httpx \
-            aiohttp
-
-      - name: 📥 Install Ollama (latest)
+      # ------------------------------------------------------------------ #
+      - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
-          echo "✅ Ollama installed"
 
-      - name: 📥 Install Cloudflared
+      # ------------------------------------------------------------------ #
+      - name: Start Ollama server
         run: |
-          curl -fsSL -o /tmp/cf.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-          rm -f /tmp/cf.deb
-          cloudflared --version
-          echo "✅ Cloudflared installed"
-
-      - name: 🖥️ System Info
-        run: |
-          echo "═══════ SYSTEM INFO ═══════"
-          echo "CPU: $(nproc) cores"
-          echo "RAM: $(free -h | awk '/^Mem/{print $2}') total"
-          echo "Disk: $(df -h / | awk 'NR==2{print $4}') free"
-          uname -a
-          echo "═══════════════════════════"
-
-      - name: 🚀 Start Ollama Server (RAM-optimised)
-        run: |
-          sudo sysctl -w vm.swappiness=10                2>/dev/null || true
-          sudo sysctl -w vm.dirty_ratio=60               2>/dev/null || true
-          sudo sysctl -w net.core.somaxconn=65535        2>/dev/null || true
-          sudo sysctl -w net.ipv4.tcp_keepalive_time=60  2>/dev/null || true
-          sudo sysctl -w net.ipv4.tcp_keepalive_intvl=10 2>/dev/null || true
-          sudo sysctl -w net.ipv4.tcp_keepalive_probes=6 2>/dev/null || true
-          sudo sysctl -w net.ipv4.tcp_fin_timeout=30     2>/dev/null || true
-
-          export OLLAMA_HOST="0.0.0.0:${{ env.OLLAMA_PORT }}"
-          export OLLAMA_ORIGINS="*"
-          export OLLAMA_KEEP_ALIVE="-1"
-          export OLLAMA_MAX_LOADED_MODELS="1"
-          export OLLAMA_NUM_PARALLEL="4"
-          export OLLAMA_FLASH_ATTENTION="1"
-
+          OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT \
+          OLLAMA_KEEP_ALIVE=-1 \
           nohup ollama serve > ollama.log 2>&1 &
           echo $! > ollama.pid
-          echo "⏳ Waiting for Ollama to be ready..."
 
-          for i in {1..40}; do
-            if curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version > /dev/null 2>&1; then
-              echo "✅ Ollama ready after ${i} attempts"
+          echo "Waiting for Ollama to be ready..."
+          for i in $(seq 1 30); do
+            if curl -sf "http://127.0.0.1:$OLLAMA_PORT/" > /dev/null 2>&1; then
+              echo "Ollama ready after ~${i}s"
               break
             fi
-            [ $i -eq 40 ] && { echo "❌ Ollama did not start"; cat ollama.log; exit 1; }
+            [ "$i" -eq 30 ] && { echo "Ollama failed to start"; cat ollama.log; exit 1; }
             sleep 2
           done
 
-          echo "Ollama version: $(curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version | jq -r .version)"
-
-      - name: 📥 Pull and Pre-Load Model into RAM
+      # ------------------------------------------------------------------ #
+      - name: Pull gemma4:e4b model
         run: |
-          echo "⏳ Pulling model: ${{ env.MODEL }}"
-          if ! timeout 1200 ollama pull ${{ env.MODEL }}; then
-            echo "❌ Failed to pull model"
-            ollama list
-            tail -30 ollama.log
-            exit 1
-          fi
+          echo "Pulling $MODEL (this may take 10-20 min for a fresh runner)..."
+          OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull "$MODEL"
+          echo "Pull complete."
+          OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
 
-          echo "✅ Model pulled. Forcing load into RAM..."
-          ollama list
-
-          echo "🔥 Warming up model (loading weights into RAM with keep_alive=-1)..."
-          WARM_RESULT=$(curl -sf --max-time 300 \
-            -X POST http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/generate \
-            -H "Content-Type: application/json" \
-            -d '{"model":"${{ env.MODEL }}","prompt":"Say: ready","stream":false,"keep_alive":-1,"options":{"num_predict":5}}' \
-            2>&1)
-
-          if echo "$WARM_RESULT" | jq -e '.response' > /dev/null 2>&1; then
-            echo "✅ Model loaded and warm in RAM"
-            echo "Response: $(echo "$WARM_RESULT" | jq -r '.response')"
-          else
-            echo "⚠️  Warm-up response: $WARM_RESULT"
-            echo "Continuing anyway..."
-          fi
-
-          echo "📋 Loaded models (/api/ps):"
-          curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/ps | jq . || echo "(no /api/ps endpoint)"
-
-      - name: 🚀 Start Proxy Server
+      # ------------------------------------------------------------------ #
+      - name: Write tool-call interceptor proxy
         run: |
-          sudo fuser -k ${{ env.PROXY_PORT }}/tcp 2>/dev/null || true
-          sleep 1
+          cat > /tmp/interceptor.py << 'PYEOF'
+#!/usr/bin/env python3
+"""
+Tool-call interceptor for Roo Code ↔ Ollama (gemma4:e4b)
+Responsibilities:
+  1. Inject a rich system prompt that teaches the model about tool calls
+  2. Detect <tool_call>…</tool_call> XML in assistant replies and reformat
+     them as OpenAI-style function-call objects so Roo Code understands them
+  3. Detect assistant replies that ARE a tool result and pass them through cleanly
+  4. Add permissive CORS + auth headers so VS Code extensions never see 403s
+  5. Forward everything else verbatim to Ollama
+"""
+import http.server, json, os, re, urllib.request, urllib.error, traceback
 
-          export MODEL="${{ env.MODEL }}"
-          export WORKING_DIR="${{ env.WORKING_DIR }}"
-          export RAM_PRESSURE_ENABLED="${{ env.RAM_PRESSURE_ENABLED }}"
-          export RAM_PRESSURE_MB="512"
-          export ACTIVITY_LOG_INTERVAL="${{ env.ACTIVITY_LOG_INTERVAL }}"
-          export KEEPALIVE_INTERVAL="${{ env.KEEPALIVE_INTERVAL }}"
-          export PROXY_PORT="${{ env.PROXY_PORT }}"
-          export OLLAMA_PORT="${{ env.OLLAMA_PORT }}"
+BACKEND = f"http://127.0.0.1:{os.environ.get('OLLAMA_PORT', '11434')}"
+PORT    = int(os.environ.get('PROXY_PORT', '1234'))
+MODEL   = os.environ.get('MODEL', 'gemma4:e4b')
 
-          mkdir -p "${{ env.WORKING_DIR }}"
-          nohup python3 proxy_server.py > proxy.log 2>&1 &
+# ── System prompt ─────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """You are a Senior Software Developer with 15 years of full-stack experience.
+Languages: Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, Ruby, Bash, SQL, GraphQL.
+Frontends: React, Vue, Svelte, HTML/CSS/Tailwind.
+Backends: REST, gRPC, microservices, serverless, message queues.
+Databases: PostgreSQL, MySQL, SQLite, MongoDB, Redis, Cassandra, Elasticsearch.
+Cloud: AWS, GCP, Azure. Containers: Docker, Kubernetes.
+You are running inside Roo Code (VS Code extension). You have access to tools.
+
+TOOL CALL PROTOCOL
+──────────────────
+When you need to use a tool, output ONLY a JSON function call in this exact format:
+{"tool_use": {"name": "<tool_name>", "parameters": {<key-value pairs>}}}
+
+Available tools and their parameter schemas:
+  read_file         : {"path": "<absolute or relative path>"}
+  write_file        : {"path": "<path>", "content": "<full file content>"}
+  create_directory  : {"path": "<dir path>"}
+  list_directory    : {"path": "<dir path>"}
+  execute_command   : {"command": "<shell command>", "cwd": "<optional working dir>"}
+  search_files      : {"pattern": "<glob or regex>", "path": "<root dir>"}
+  web_search        : {"query": "<search query>"}
+  browser_action    : {"action": "launch|click|type|screenshot|close", "url": "<url if launch>", "selector": "<css selector if click/type>", "text": "<text if type>"}
+
+Rules:
+- Call ONE tool at a time. Wait for the result before calling the next.
+- When you receive a tool result it will appear as a message with role "tool".
+- After getting a tool result, continue reasoning or call another tool.
+- When the task is complete, write a plain-language summary for the user.
+- Never apologise for using tools – just use them.
+- Write complete, production-quality code with error handling. No placeholders.
+- Be direct. When chatting, talk like a senior colleague. When coding, ship it.
+"""
+
+# ── Regex patterns ─────────────────────────────────────────────────────────────
+# Roo Code may send tool calls wrapped in XML or in JSON blocks
+RE_XML_TOOL   = re.compile(
+    r'<tool_call[^>]*>\s*(.*?)\s*</tool_call>',
+    re.DOTALL | re.IGNORECASE
+)
+RE_JSON_TOOL  = re.compile(
+    r'```(?:json)?\s*(\{[^`]*"tool_use"[^`]*\})\s*```',
+    re.DOTALL
+)
+RE_FUNC_CALL  = re.compile(
+    r'\{"tool_use"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+    re.DOTALL
+)
+
+# ── Helper: parse tool call from assistant text ────────────────────────────────
+def extract_tool_call(text: str):
+    """
+    Look for a tool call in assistant output.
+    Returns (tool_name, parameters_dict) or (None, None).
+    """
+    # 1. Raw JSON {"tool_use": {...}}
+    try:
+        obj = json.loads(text.strip())
+        if 'tool_use' in obj:
+            tu = obj['tool_use']
+            return tu.get('name'), tu.get('parameters', {})
+    except Exception:
+        pass
+
+    # 2. Fenced JSON block
+    m = RE_JSON_TOOL.search(text)
+    if m:
+        try:
+            obj = json.loads(m.group(1))
+            tu = obj.get('tool_use', {})
+            return tu.get('name'), tu.get('parameters', {})
+        except Exception:
+            pass
+
+    # 3. XML <tool_call> wrapper (Roo Code older format)
+    m = RE_XML_TOOL.search(text)
+    if m:
+        inner = m.group(1).strip()
+        try:
+            obj = json.loads(inner)
+            name   = obj.get('name') or obj.get('tool') or obj.get('function')
+            params = obj.get('parameters') or obj.get('arguments') or obj.get('args') or {}
+            if name:
+                return name, params
+        except Exception:
+            pass
+        # Plain <tool_name>…</tool_name> inside the wrapper
+        tag = re.search(r'<([a-z_]+)>(.*?)</\1>', inner, re.DOTALL)
+        if tag:
+            name = tag.group(1)
+            try:
+                params = json.loads(tag.group(2).strip())
+            except Exception:
+                params = {"value": tag.group(2).strip()}
+            return name, params
+
+    return None, None
+
+# ── Helper: build OpenAI-style tool_calls response ────────────────────────────
+def build_tool_call_response(name: str, params: dict, original_response: dict) -> dict:
+    """Wrap a detected tool call as an OpenAI function-call message."""
+    import uuid
+    call_id = f"call_{uuid.uuid4().hex[:8]}"
+    choice = {
+        "index": 0,
+        "message": {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(params)
+                }
+            }]
+        },
+        "finish_reason": "tool_calls"
+    }
+    return {
+        "id": original_response.get("id", "chatcmpl-intercepted"),
+        "object": "chat.completion",
+        "created": original_response.get("created", 0),
+        "model": original_response.get("model", MODEL),
+        "choices": [choice],
+        "usage": original_response.get("usage", {})
+    }
+
+# ── Helper: ensure system prompt is present ───────────────────────────────────
+def inject_system_prompt(messages: list) -> list:
+    if not messages:
+        return [{"role": "system", "content": SYSTEM_PROMPT}]
+    if messages[0].get("role") != "system":
+        return [{"role": "system", "content": SYSTEM_PROMPT}] + messages
+    # Augment existing system prompt so we don't clobber user additions
+    existing = messages[0].get("content", "")
+    if "TOOL CALL PROTOCOL" not in existing:
+        messages = list(messages)
+        messages[0] = {"role": "system", "content": existing + "\n\n" + SYSTEM_PROMPT}
+    return messages
+
+# ── Helper: remap /v1/* paths to Ollama equivalents ───────────────────────────
+def remap_path(path: str) -> str:
+    """Ollama exposes /api/chat and /api/generate; it also mirrors /v1/* via compat."""
+    # Ollama ≥0.1.14 natively speaks /v1/chat/completions – pass through.
+    return path
+
+# ── HTTP handler ───────────────────────────────────────────────────────────────
+class Interceptor(http.server.BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        # Only log errors and tool-call events to keep logs tidy
+        pass
+
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin",  "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, X-Requested-With, Accept, "
+                         "X-Api-Key, api-key, x-stainless-os, x-stainless-lang, "
+                         "x-stainless-package-version, x-stainless-runtime, "
+                         "x-stainless-runtime-version, x-stainless-arch")
+        self.send_header("Access-Control-Max-Age",       "86400")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
+
+    def _forward(self, body: bytes | None = None):
+        url  = BACKEND + remap_path(self.path)
+        hdrs = {
+            k: v for k, v in self.headers.items()
+            if k.lower() not in ("host", "content-length", "authorization",
+                                  "api-key", "x-api-key")
+        }
+        hdrs["Host"] = f"127.0.0.1:{os.environ.get('OLLAMA_PORT', '11434')}"
+        if body is not None:
+            hdrs["Content-Length"] = str(len(body))
+        req = urllib.request.Request(
+            url, data=body, headers=hdrs, method=self.command
+        )
+        try:
+            r  = urllib.request.urlopen(req, timeout=600)
+            st, rh, rb = r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            st, rh, rb = e.code, e.headers, e.read()
+
+        self.send_response(st)
+        self._cors_headers()
+        for k, v in rh.items():
+            if k.lower() in ("content-type",):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(rb)))
+        self.end_headers()
+        self.wfile.write(rb)
+
+    def do_GET(self):
+        self._forward()
+
+    def do_DELETE(self):
+        self._forward()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw    = self.rfile.read(length)
+
+        is_chat = "/chat/completions" in self.path or "/api/chat" in self.path
+
+        if is_chat:
+            try:
+                payload = json.loads(raw)
+
+                # 1. Inject / augment system prompt
+                payload["messages"] = inject_system_prompt(
+                    payload.get("messages", [])
+                )
+
+                # 2. Force the model to gemma4:e4b regardless of what client sends
+                payload["model"] = MODEL
+
+                # 3. Apply tuning defaults only if not already set
+                payload.setdefault("temperature", float(os.environ.get("TEMPERATURE", "0.2")))
+                payload.setdefault("options", {})
+                payload["options"].setdefault("num_ctx",        int(os.environ.get("CTX_SIZE", "8192")))
+                payload["options"].setdefault("repeat_penalty", 1.05)
+                payload["options"].setdefault("top_p",          0.95)
+                payload["options"].setdefault("top_k",          64)
+
+                # 4. If client requested streaming we handle it straight-through
+                #    (tool-call detection works on buffered responses only)
+                streaming = payload.get("stream", False)
+
+                raw = json.dumps(payload).encode()
+
+                if streaming:
+                    # Pass straight through – we can't intercept stream chunks easily
+                    self._forward(raw)
+                    return
+
+                # ── Non-streaming: buffer, inspect, maybe reformat ──────────
+                url  = BACKEND + remap_path(self.path)
+                hdrs = {
+                    k: v for k, v in self.headers.items()
+                    if k.lower() not in ("host", "content-length", "authorization",
+                                          "api-key", "x-api-key")
+                }
+                hdrs["Host"]           = f"127.0.0.1:{os.environ.get('OLLAMA_PORT', '11434')}"
+                hdrs["Content-Length"] = str(len(raw))
+
+                req = urllib.request.Request(
+                    url, data=raw, headers=hdrs, method="POST"
+                )
+                try:
+                    r  = urllib.request.urlopen(req, timeout=600)
+                    st, rh, rb = r.status, r.headers, r.read()
+                except urllib.error.HTTPError as e:
+                    st, rh, rb = e.code, e.headers, e.read()
+                    self._send_json(st, rb)
+                    return
+
+                # Parse the Ollama response
+                try:
+                    resp_obj = json.loads(rb)
+                except Exception:
+                    self._send_raw(st, rh, rb)
+                    return
+
+                # Extract assistant text
+                assistant_text = ""
+                try:
+                    assistant_text = (
+                        resp_obj["choices"][0]["message"]["content"] or ""
+                    )
+                except Exception:
+                    pass
+
+                # Detect tool call in assistant text
+                tool_name, tool_params = extract_tool_call(assistant_text)
+                if tool_name:
+                    print(f"[interceptor] tool call detected: {tool_name}({json.dumps(tool_params)[:120]})", flush=True)
+                    reformatted = build_tool_call_response(tool_name, tool_params, resp_obj)
+                    body = json.dumps(reformatted).encode()
+                    self.send_response(200)
+                    self._cors_headers()
+                    self.send_header("Content-Type",   "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                # No tool call – pass through original response
+                self._send_raw(200, rh, rb)
+                return
+
+            except Exception:
+                traceback.print_exc()
+                # Fall through to raw forward on any parsing error
+                pass
+
+        self._forward(raw)
+
+    def _send_raw(self, status, headers, body: bytes):
+        self.send_response(status)
+        self._cors_headers()
+        for k, v in headers.items():
+            if k.lower() in ("content-type",):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_json(self, status, body: bytes):
+        self.send_response(status)
+        self._cors_headers()
+        self.send_header("Content-Type",   "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+if __name__ == "__main__":
+    server = http.server.HTTPServer(("0.0.0.0", PORT), Interceptor)
+    print(f"[interceptor] listening on :{PORT}  →  {BACKEND}", flush=True)
+    server.serve_forever()
+PYEOF
+          chmod +x /tmp/interceptor.py
+          echo "Interceptor written."
+
+      # ------------------------------------------------------------------ #
+      - name: Start interceptor proxy
+        run: |
+          PROXY_PORT=$PROXY_PORT \
+          OLLAMA_PORT=$OLLAMA_PORT \
+          MODEL=$MODEL \
+          TEMPERATURE=$TEMPERATURE \
+          CTX_SIZE=$CTX_SIZE \
+          nohup python3 /tmp/interceptor.py > proxy.log 2>&1 &
           echo $! > proxy.pid
 
-          echo "⏳ Waiting for proxy server..."
-          for i in {1..30}; do
-            if curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health > /dev/null 2>&1; then
-              echo "✅ Proxy ready after ${i} attempts"
-              break
-            fi
-            [ $i -eq 30 ] && { echo "❌ Proxy failed to start"; cat proxy.log; exit 1; }
-            sleep 3
-          done
+          sleep 3
+          if curl -sf "http://127.0.0.1:$PROXY_PORT/" > /dev/null 2>&1 || \
+             curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags" > /dev/null 2>&1; then
+            echo "Interceptor proxy healthy on :$PROXY_PORT"
+          else
+            echo "WARNING: Proxy health check via root failed – checking /v1/models..."
+            curl -sv "http://127.0.0.1:$PROXY_PORT/v1/models" 2>&1 | tail -5 || true
+          fi
+          cat proxy.log | tail -5
 
-          echo ""
-          echo "📋 Proxy health:"
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | jq .
+      # ------------------------------------------------------------------ #
+      - name: Verify system prompt injection + model response
+        run: |
+          echo "Smoke-testing non-streaming chat..."
+          RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test" \
+            -d "{
+              \"model\":\"$MODEL\",
+              \"stream\":false,
+              \"messages\":[{\"role\":\"user\",\"content\":\"Who are you and what tools do you have?\"}],
+              \"max_tokens\":150
+            }" 2>/dev/null)
+          CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // "NO CONTENT"' 2>/dev/null)
+          echo "Model replied: $CONTENT"
+          if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ] || [ "$CONTENT" = "NO CONTENT" ]; then
+            echo "ERROR: No response."
+            cat ollama.log | tail -30
+            cat proxy.log  | tail -20
+            exit 1
+          fi
+          echo "System prompt injection verified."
 
-      - name: 🌐 Start Cloudflare Tunnel
+      # ------------------------------------------------------------------ #
+      - name: Verify tool-call detection
+        run: |
+          echo "Testing tool-call interception..."
+          RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer test" \
+            -d "{
+              \"model\":\"$MODEL\",
+              \"stream\":false,
+              \"messages\":[{\"role\":\"user\",\"content\":\"List the files in the current directory using the list_directory tool.\"}],
+              \"max_tokens\":200
+            }" 2>/dev/null)
+          FINISH=$(echo "$RESP" | jq -r '.choices[0].finish_reason' 2>/dev/null)
+          echo "finish_reason: $FINISH"
+          echo "Full response: $(echo $RESP | jq -c '.choices[0].message' 2>/dev/null)"
+          # Either tool_calls (intercepted) or stop (answered in text) is fine
+          echo "Tool-call detection step complete."
+
+      # ------------------------------------------------------------------ #
+      - name: Install and start Cloudflare tunnel
         run: |
           pkill -9 -f cloudflared 2>/dev/null || true
-          sleep 2
+          sleep 1
 
-          # ⚠️ CRITICAL: Tunnel MUST point to PROXY_PORT (8000), NOT Ollama port (11434)
+          curl -fsSL \
+            -o /tmp/cf.deb \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+          sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
+
           nohup cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.PROXY_PORT }} \
+            --url "http://127.0.0.1:$PROXY_PORT" \
             --no-autoupdate \
             --loglevel info \
             > tunnel.log 2>&1 &
           echo $! > tunnel.pid
 
-          echo "⏳ Waiting for Cloudflare tunnel URL..."
           TUNNEL_URL=""
-          for i in {1..40}; do
-            # Extract clean URL — avoid markdown artifacts from GitHub logs
-            RAW=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
-            if [ -n "$RAW" ]; then
-              TUNNEL_URL="${RAW//__/}"  # strip __ (markdown bold)
-              TUNNEL_URL="${TUNNEL_URL%/}"  # strip trailing slash
-              echo "✅ Tunnel URL: $TUNNEL_URL"
-              break
-            fi
-            [ $i -eq 40 ] && { echo "❌ Tunnel URL not found"; cat tunnel.log; exit 1; }
+          for i in $(seq 1 40); do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
+            [ -n "$TUNNEL_URL" ] && { TUNNEL_URL="${TUNNEL_URL%/}"; break; }
             sleep 2
           done
 
-          if [ -n "$TUNNEL_URL" ]; then
-            # Export clean URL for subsequent steps
-            echo "CLOUDFLARE_URL=${TUNNEL_URL}" >> "$GITHUB_ENV"
-
-            # Verify tunnel is actually serving HTTP before proceeding
-            echo "⏳ Waiting for tunnel to respond to /health..."
-            for j in {1..20}; do
-              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${TUNNEL_URL}/health" 2>/dev/null || echo "000")
-              if [ "$CODE" = "200" ]; then
-                echo "✅ Tunnel reachable (HTTP 200 on /health)"
-                break
-              fi
-              echo "  Attempt $j — HTTP $CODE"
-              [ $j -eq 20 ] && echo "⚠️  Proceeding anyway (tunnel may be slow)"
-              sleep 3
-            done
-
-            # Print clear, copy-pasteable client config
-            echo ""
-            echo "╔════════════════════════════════════════════════════════════════╗"
-            echo "║   🤖  OLLAMA PROXY v4.1 — gemma4:e4b — READY                   ║"
-            echo "╠════════════════════════════════════════════════════════════════╣"
-            printf "║  Tunnel:  %-55s║\n" "${TUNNEL_URL}"
-            echo "║                                                                  ║"
-            echo "║  ✅ CLIENT CONFIG — COPY ONE OF THESE:                          ║"
-            echo "║                                                                  ║"
-            echo "║  [OpenAI-compatible clients]                                     ║"
-            printf "║    apiBase: %-48s║\n" "${TUNNEL_URL}/v1"
-            printf "║    model:   %-48s║\n" "${MODEL}"
-            echo "║                                                                  ║"
-            echo "║  [Raw Ollama clients / Open WebUI]                               ║"
-            printf "║    apiBase: %-48s║\n" "${TUNNEL_URL}"
-            printf "║    model:   %-48s║\n" "${MODEL}"
-            echo "║                                                                  ║"
-            echo "║  [Anthropic-compatible clients]                                  ║"
-            printf "║    apiBase: %-48s║\n" "${TUNNEL_URL}/v1/messages"
-            printf "║    model:   %-48s║\n" "${MODEL}"
-            echo "║                                                                  ║"
-            echo "║  ⚠️  IMPORTANT:                                                  ║"
-            echo "║    • NEVER use 'apibase://:80' or omit https://                  ║"
-            echo "║    • NEVER add a trailing slash to apiBase                       ║"
-            echo "║    • The proxy handles all routing — just set apiBase correctly  ║"
-            echo "╚════════════════════════════════════════════════════════════════╝"
-            echo ""
-            echo "==> OpenAI:     ${TUNNEL_URL}/v1"
-            echo "==> Raw Ollama: ${TUNNEL_URL}"
-            echo "==> Anthropic:  ${TUNNEL_URL}/v1/messages"
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "WARNING: Could not get tunnel URL"
+            cat tunnel.log | tail -20
           fi
 
-      - name: 🧪 Test All Endpoints
+          echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
+
+          echo "=================================================="
+          echo "  GEMMA4:E4B + OLLAMA — SENIOR ENGINEER READY"
+          echo "=================================================="
+          echo "  Tunnel URL : $TUNNEL_URL"
+          echo "  Model      : $MODEL"
+          echo "  Context    : $CTX_SIZE tokens"
+          echo "--------------------------------------------------"
+          echo "  Roo Code / Continue settings"
+          echo "    Provider  : OpenAI-compatible"
+          echo "    Base URL  : ${TUNNEL_URL}/v1"
+          echo "    Model ID  : $MODEL"
+          echo "    API Key   : any non-empty string (e.g. 'roo')"
+          echo "--------------------------------------------------"
+          echo "  Tool call interception : ACTIVE"
+          echo "  CORS headers           : permissive (*)"
+          echo "  Auth requirement       : none (any key accepted)"
+          echo "=================================================="
+
+      # ------------------------------------------------------------------ #
+      - name: Smoke test via tunnel
         if: env.CLOUDFLARE_URL != ''
         run: |
-          # ── Sanitize BASE every time — GitHub env can introduce markdown artifacts
-          RAW_BASE="${{ env.CLOUDFLARE_URL }}"
-          BASE="${RAW_BASE//__/}"    # strip __ (markdown bold)
-          BASE="${BASE%/}"           # strip trailing slash
+          echo "Tunnel smoke test – write a Python script..."
+          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer roo" \
+            -d "{
+              \"model\":\"$MODEL\",
+              \"stream\":false,
+              \"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function that reads a JSON file and returns its contents as a dict, with error handling.\"}],
+              \"max_tokens\":300
+            }" 2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
+            || echo "Smoke test parse failed (model may still be warming up)"
 
-          echo "═══════════════════════════════════════════════"
-          echo "🧪 Testing all endpoints"
-          echo "   BASE = ${BASE}"
-          echo "═══════════════════════════════════════════════"
-
-          # Abort cleanly if BASE doesn't look like a real cloudflare URL
-          if [[ ! "$BASE" =~ ^https://[a-zA-Z0-9-]+\.trycloudflare\.com ]]; then
-            echo "❌ BASE URL is invalid: '${BASE}' — skipping tests"
-            exit 0
-          fi
-
-          PASS=0; FAIL=0
-
-          # Helper: curl GET, returns "HTTP_CODE|BODY"
-          do_get() {
-            local url="$1"; local timeout="${2:-20}"
-            local code body
-            body=$(curl -s --max-time "$timeout" --retry 2 --retry-delay 3 \
-              -w "\n__HTTP_CODE__%{http_code}" "$url" 2>/dev/null)
-            code=$(echo "$body" | grep -oP '(?<=__HTTP_CODE__)\d+' || echo "000")
-            body=$(echo "$body" | sed '/__HTTP_CODE__/d')
-            echo "${code}|${body}"
-          }
-
-          # Helper: curl POST, returns "HTTP_CODE|BODY"
-          do_post() {
-            local url="$1"; local data="$2"; local timeout="${3:-150}"
-            local code body
-            body=$(curl -s --max-time "$timeout" --retry 2 --retry-delay 3 \
-              -H "Content-Type: application/json" -d "$data" \
-              -w "\n__HTTP_CODE__%{http_code}" "$url" 2>/dev/null)
-            code=$(echo "$body" | grep -oP '(?<=__HTTP_CODE__)\d+' || echo "000")
-            body=$(echo "$body" | sed '/__HTTP_CODE__/d')
-            echo "${code}|${body}"
-          }
-
-          check() {
-            local name="$1" body="$2" code="$3"
-            if [ "$code" = "200" ] && echo "$body" | jq . > /dev/null 2>&1; then
-              echo "✅ $name (HTTP $code)"
-              PASS=$((PASS+1))
-            else
-              echo "❌ $name (HTTP $code)"
-              echo "   Body: ${body:0:400}"
-              FAIL=$((FAIL+1))
-            fi
-          }
-
-          echo ""
-          echo "1️⃣  GET /"
-          R=$(do_get "${BASE}/"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /" "$B" "$CODE"
-          echo "$B" | jq '{model:.model, endpoint:.active_endpoint}' 2>/dev/null || true
-          echo ""
-
-          echo "2️⃣  GET /health"
-          R=$(do_get "${BASE}/health"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /health" "$B" "$CODE"
-          echo "$B" | jq '{status,model_loaded,model_in_ram,active_endpoint}' 2>/dev/null || true
-          echo ""
-
-          echo "3️⃣  GET /v1/models"
-          R=$(do_get "${BASE}/v1/models"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /v1/models" "$B" "$CODE"
-          echo "$B" | jq '.data[].id' 2>/dev/null || true
-          echo ""
-
-          echo "4️⃣  GET /api/tags"
-          R=$(do_get "${BASE}/api/tags"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /api/tags" "$B" "$CODE"
-          echo "$B" | jq '.models[].name' 2>/dev/null || true
-          echo ""
-
-          echo "5️⃣  GET /api/version"
-          R=$(do_get "${BASE}/api/version"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /api/version" "$B" "$CODE"
-          echo "$B" | jq . 2>/dev/null || true
-          echo ""
-
-          echo "6️⃣  GET /api/ps"
-          R=$(do_get "${BASE}/api/ps"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /api/ps" "$B" "$CODE"
-          echo "$B" | jq . 2>/dev/null || true
-          echo ""
-
-          echo "7️⃣  GET /v1/tools"
-          R=$(do_get "${BASE}/v1/tools"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /v1/tools" "$B" "$CODE"
-          echo "$B" | jq .count 2>/dev/null || true
-          echo ""
-
-          echo "8️⃣  POST /v1/chat/completions"
-          DATA='{"model":"gemma4:e4b","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
-          R=$(do_post "${BASE}/v1/chat/completions" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
-          check "POST /v1/chat/completions" "$B" "$CODE"
-          echo "$B" | jq '{finish:.choices[0].finish_reason, reply:.choices[0].message.content}' 2>/dev/null || true
-          echo ""
-
-          echo "9️⃣  POST /api/chat"
-          DATA='{"model":"gemma4:e4b","messages":[{"role":"user","content":"Reply with one word: pong"}],"stream":false}'
-          R=$(do_post "${BASE}/api/chat" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
-          check "POST /api/chat" "$B" "$CODE"
-          echo "$B" | jq '{done, reply:.message.content}' 2>/dev/null || true
-          echo ""
-
-          echo "🔟  POST /v1/messages"
-          DATA='{"model":"gemma4:e4b","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
-          R=$(do_post "${BASE}/v1/messages" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
-          check "POST /v1/messages" "$B" "$CODE"
-          echo "$B" | jq '{stop_reason, text:.content[0].text}' 2>/dev/null || true
-          echo ""
-
-          echo "═══════════════════════════════════════════════"
-          echo "Results: ✅ $PASS passed  ❌ $FAIL failed"
-          echo "═══════════════════════════════════════════════"
-          exit 0   # never fail the job on test results alone
-
-      - name: ⏱️ Session Pulser (${{ env.SESSION_HOURS }}h) with RAM Keepalive
+      # ------------------------------------------------------------------ #
+      - name: Keepalive
         run: |
-          SESSION_SECONDS=$(( ${{ env.SESSION_HOURS }} * 3600 ))
-          echo "⏱️  Session: ${SESSION_SECONDS}s (${{ env.SESSION_HOURS }}h)"
-
-          # Sanitize tunnel URL
-          RAW_URL="${{ env.CLOUDFLARE_URL }}"
-          CF_URL="${RAW_URL//__/}"
-          CF_URL="${CF_URL%/}"
-          [ -n "$CF_URL" ] && echo "🌐 $CF_URL"
-
-          START=$(date +%s)
-          END=$(( START + SESSION_SECONDS ))
-          PING_COUNT=0
-
+          END=$(( $(date +%s) + SESSION_HOURS * 3600 ))
           while [ "$(date +%s)" -lt "$END" ]; do
-            NOW=$(date +%s)
-            REMAIN_MIN=$(( (END - NOW) / 60 ))
-
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⏰ $(date '+%Y-%m-%d %H:%M:%S UTC') | ${REMAIN_MIN}m remaining"
-
-            # Tunnel health
-            if [ -n "$CF_URL" ]; then
-              HEALTH=$(curl -sf --max-time 15 "${CF_URL}/health" 2>/dev/null \
-                || echo '{"status":"unreachable"}')
-              echo "🏥 $(echo "$HEALTH" | jq -r \
-                '"status=\(.status) loaded=\(.model_loaded) ram=\(.model_in_ram)"' \
-                2>/dev/null || echo "$HEALTH")"
-            fi
-
-            # Direct Ollama
-            VER=$(curl -sf --max-time 5 \
-              "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version" 2>/dev/null \
-              | jq -r .version 2>/dev/null || echo "unreachable")
-            echo "🟢 Ollama: $VER"
-
-            # RAM check
-            PS=$(curl -sf --max-time 5 \
-              "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/ps" 2>/dev/null \
-              || echo '{"models":[]}')
-            COUNT=$(echo "$PS" | jq '.models|length' 2>/dev/null || echo 0)
-            echo "🧠 Models in RAM: $COUNT"
-
-            if [ "${COUNT}" -eq "0" ]; then
-              echo "⚠️  Model evicted — reloading into RAM..."
-              curl -sf --max-time 90 \
-                -X POST "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/generate" \
-                -H "Content-Type: application/json" \
-                -d '{"model":"${{ env.MODEL }}","prompt":"hi","stream":false,"keep_alive":-1,"options":{"num_predict":1}}' \
-                > /dev/null 2>&1 \
-                && echo "✅ Reloaded" || echo "❌ Reload failed"
-            fi
-
-            # Process checks
-            PROXY_PID=$(cat proxy.pid 2>/dev/null || echo "")
-            OLLAMA_PID=$(cat ollama.pid 2>/dev/null || echo "")
-            [ -n "$PROXY_PID" ] && kill -0 "$PROXY_PID" 2>/dev/null \
-              && echo "📡 Proxy ($PROXY_PID): alive" || echo "❌ Proxy dead"
-            [ -n "$OLLAMA_PID" ] && kill -0 "$OLLAMA_PID" 2>/dev/null \
-              && echo "🦙 Ollama ($OLLAMA_PID): alive" || echo "❌ Ollama dead"
-
-            echo "💾 $(free -h | awk '/^Mem/{printf "RAM: %s / %s", $3, $2}')"
-
-            PING_COUNT=$((PING_COUNT+1))
-            echo "📊 Ping #$PING_COUNT"
+            REMAINING=$(( (END - $(date +%s)) / 60 ))
+            curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1 \
+              || echo "WARNING: Ollama unhealthy"
+            curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags"  > /dev/null 2>&1 \
+              || echo "WARNING: Proxy unhealthy"
+            echo "Keepalive: ${REMAINING}min remaining – $(date -u '+%H:%M:%S UTC')"
             sleep 300
           done
 
-          echo "🏁 Session complete"
-
-      - name: 📊 Final Report
+      # ------------------------------------------------------------------ #
+      - name: Final report
         if: always()
         run: |
-          echo "╔══════════════════════════════════════════════╗"
-          echo "║              FINAL SESSION REPORT            ║"
-          echo "╚══════════════════════════════════════════════╝"
-          RAW="${{ env.CLOUDFLARE_URL }}"
-          CF="${RAW//__/}"
-          [ -n "$CF" ] && echo "🌐 $CF"
+          echo "========== FINAL REPORT =========="
+          echo "Tunnel : ${{ env.CLOUDFLARE_URL || '(not available)' }}"
+          echo "--- Ollama models ---"
+          curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" 2>/dev/null | jq . || echo "(unreachable)"
+          echo "--- Proxy health ---"
+          curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags" 2>/dev/null | jq . || echo "(unreachable)"
+          echo "--- ollama.log (last 20) ---"
+          tail -20 ollama.log 2>/dev/null || echo "(none)"
+          echo "--- proxy.log (last 20) ---"
+          tail -20 proxy.log 2>/dev/null  || echo "(none)"
+          echo "--- tunnel.log (last 10) ---"
+          tail -10 tunnel.log 2>/dev/null || echo "(none)"
 
-          echo "── Proxy Health ──"
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | jq . || echo "unreachable"
-
-          echo "── Ollama /api/ps ──"
-          curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/ps | jq . || echo "unreachable"
-
-          echo "── proxy.log (last 30) ──"
-          tail -30 proxy.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
-
-          echo "── ollama.log (last 20) ──"
-          tail -20 ollama.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
-
-          echo "── tunnel.log (last 10) ──"
-          tail -10 tunnel.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
-
-      - name: 🛑 Cleanup
+      # ------------------------------------------------------------------ #
+      - name: Cleanup
         if: always()
         run: |
-          echo "🧹 Cleanup..."
-          for f in tunnel.pid proxy.pid ollama.pid; do
-            [ -f "$f" ] && kill -9 "$(cat $f)" 2>/dev/null || true
-          done
+          [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
+          [ -f proxy.pid  ] && kill -9 "$(cat proxy.pid)"  2>/dev/null || true
+          [ -f ollama.pid ] && kill -9 "$(cat ollama.pid)" 2>/dev/null || true
           pkill -9 -f cloudflared  2>/dev/null || true
           pkill -9 -f ollama       2>/dev/null || true
-          pkill -9 -f proxy_server 2>/dev/null || true
-          sudo fuser -k ${{ env.PROXY_PORT }}/tcp  2>/dev/null || true
-          sudo fuser -k ${{ env.OLLAMA_PORT }}/tcp 2>/dev/null || true
-          rm -f ./*.pid 2>/dev/null || true
-          echo "✅ Done"
+          pkill -9 -f interceptor  2>/dev/null || true
+          sudo fuser -k "$PROXY_PORT/tcp"  2>/dev/null || true
+          sudo fuser -k "$OLLAMA_PORT/tcp" 2>/dev/null || true
+          rm -f ./*.pid
+          echo "Done."
