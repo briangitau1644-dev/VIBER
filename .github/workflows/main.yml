@@ -2,28 +2,13 @@ name: Senior Engineer CPU - Gemma4-E4B - GitHub Actions
 
 on:
   workflow_dispatch:
-    inputs:
-      model_download_url:
-        description: 'Direct GGUF download URL'
-        required: false
-        default: 'https://huggingface.co'
-      model_filename:
-        description: 'GGUF filename'
-        required: false
-        default: 'google_gemma-4-E4B-it-bf16.gguf'
-      session_hours:
-        description: 'Session duration (max 6)'
-        required: false
-        default: '6'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL_FILENAME: ${{ github.event.inputs.model_filename || 'google_gemma-4-E4B-it-bf16.gguf' }}
-  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url || 'https://huggingface.co' }}
-  SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  SERVER_PORT: '8080'
-  BACKEND_PORT: '11434'
+  MODEL_URL: 'https://huggingface.co'
   MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
+  SERVER_PORT: '8080'
+  PROXY_PORT: '11434'
 
 jobs:
   senior-engineer-gemma4-cpu:
@@ -35,20 +20,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Kill Any Stale Servers
+      - name: Clean Ports
         run: |
           pkill -9 -f llama-server 2>/dev/null || true
-          pkill -9 -f cloudflared  2>/dev/null || true
-          pkill -9 -f proxy.py     2>/dev/null || true
-          sudo fuser -k 8080/tcp   2>/dev/null || true
-          sudo fuser -k 11434/tcp  2>/dev/null || true
+          pkill -9 -f proxy.py 2>/dev/null || true
+          sudo fuser -k 8080/tcp 2>/dev/null || true
+          sudo fuser -k 11434/tcp 2>/dev/null || true
 
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget cmake build-essential python3
+          sudo apt-get install -y -qq curl wget cmake build-essential python3 git
 
-      - name: Clone and Build llama.cpp
+      - name: Build Latest llama.cpp
         run: |
           git clone --depth 1 https://github.com
           cd llama.cpp
@@ -56,10 +40,11 @@ jobs:
           cmake --build build --config Release -j$(nproc)
           echo "SERVER_BIN=$(realpath build/bin/llama-server)" >> $GITHUB_ENV
 
-      - name: Download Model
+      - name: Download Model (Hardcoded)
         run: |
           mkdir -p models
-          curl -fL -o "$MODEL_PATH" "$MODEL_DOWNLOAD_URL"
+          echo "Downloading Gemma-4..."
+          curl -fL -o "$MODEL_PATH" "$MODEL_URL"
 
       - name: Start Llama Server
         run: |
@@ -71,15 +56,16 @@ jobs:
             --chat-template gemma &
           sleep 15
 
-      - name: Start Ollama-Style Wrapper Proxy
+      - name: Start Ollama-Style Proxy Wrapper
         run: |
           cat << 'PYEOF' > proxy.py
           import http.server, urllib.request, json
 
+          # This is the "Ollama Modelfile" Persona Injection
           SYSTEM_PROMPT = (
               "You are a Senior Full-Stack Engineer (15+ years exp). "
-              "Expert in Python Django, React, and DevOps. "
-              "Provide complete code, no placeholders, and a professional tone."
+              "Expert in Python (Django), JS (React), and System Architecture. "
+              "Respond with complete, production-ready code. No placeholders."
           )
 
           class ProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -87,10 +73,10 @@ jobs:
                   content_length = int(self.headers['Content-Length'])
                   body = json.loads(self.rfile.read(content_length))
                   
-                  # Replicate Ollama's Modelfile 'SYSTEM' instruction injection
-                  if "messages" in body and isinstance(body["messages"], list):
-                      # Check if system prompt is already there; if not, insert it
-                      if not any(m.get("role") == "system" for m in body["messages"]):
+                  # Ensure the System Role is injected exactly like Ollama does
+                  if "messages" in body:
+                      has_system = any(m.get("role") == "system" for m in body["messages"])
+                      if not has_system:
                           body["messages"].insert(0, {"role": "system", "content": SYSTEM_PROMPT})
                   
                   try:
@@ -102,12 +88,20 @@ jobs:
                       with urllib.request.urlopen(req) as res:
                           self.send_response(res.getcode())
                           self.send_header("Content-Type", "application/json")
+                          self.send_header("Access-Control-Allow-Origin", "*")
                           self.end_headers()
                           self.wfile.write(res.read())
                   except Exception as e:
                       self.send_response(500)
                       self.end_headers()
                       self.wfile.write(str(e).encode())
+
+              def do_OPTIONS(self):
+                  self.send_response(200)
+                  self.send_header("Access-Control-Allow-Origin", "*")
+                  self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                  self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                  self.end_headers()
 
           http.server.HTTPServer(('0.0.0.0', 11434), ProxyHandler).serve_forever()
           PYEOF
@@ -116,16 +110,14 @@ jobs:
 
       - name: Expose via Cloudflared
         run: |
-          wget -q https://github.com
-          sudo dpkg -i cloudflared-linux-amd64.deb
-          cloudflared tunnel --url http://localhost:11434 &
+          curl -L https://github.com -o cloudflared
+          chmod +x cloudflared
+          ./cloudflared tunnel --url http://localhost:11434 &
           sleep 10
           echo "---------------------------------------------------"
-          echo "TUNNEL ENDPOINT:"
-          curl -s http://localhost:45678/metrics | grep -o 'https://[-a-z0-9.]*.trycloudflare.com' || echo "Tunnel not found yet..."
+          echo "ACCESS URL:"
+          curl -s http://localhost:45678/metrics | grep -o 'https://[-a-z0-9.]*.trycloudflare.com'
           echo "---------------------------------------------------"
 
       - name: Keep Alive
-        run: |
-          echo "Session active for ${{ env.SESSION_HOURS }} hours."
-          sleep $(( ${{ env.SESSION_HOURS }} * 3600 ))
+        run: sleep 21600
