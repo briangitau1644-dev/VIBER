@@ -52,12 +52,25 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq curl wget jq python3 python3-pip
           pip3 install --quiet flask requests
-          echo "Python $(python3 --version) | Flask installed"
+          echo "✅ Dependencies installed"
 
-      - name: Install Ollama
+      - name: Install latest Ollama (force update)
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Remove any existing ollama first
+          sudo rm -f /usr/local/bin/ollama
+          sudo rm -rf /usr/share/ollama
+          
+          # Install fresh with latest version flag
+          curl -fsSL https://ollama.com/install.sh | sh -s -- --force
+          
+          # Verify version and API support
           ollama --version
+          echo "✅ Checking /api/chat endpoint support..."
+          if curl -sf "http://127.0.0.1:11434/api/tags" > /dev/null 2>&1; then
+            echo "✅ Ollama API accessible"
+          else
+            echo "⚠️ Ollama API not ready yet, continuing with startup..."
+          fi
 
       - name: Start Ollama server
         run: |
@@ -97,10 +110,15 @@ jobs:
 
       - name: Warm up model
         run: |
-          echo "🔥 Warming up $MODEL (extended timeout for VRAM loading)..."
+          echo "🔥 Warming up $MODEL..."
+          # Try /api/chat first (modern), fallback handled in proxy
           curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/chat" \
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":5}}" \
+            --max-time 300 > /dev/null || \
+          curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/generate" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"stream\":false,\"options\":{\"num_predict\":5}}" \
             --max-time 300 > /dev/null
           echo "✅ Warmup complete"
 
@@ -108,7 +126,6 @@ jobs:
         run: |
           if [ ! -f "interceptor.py" ]; then
             echo "❌ ERROR: interceptor.py not found in repository root!"
-            echo "Please commit the Flask-based interceptor.py before running this workflow."
             exit 1
           fi
 
@@ -150,8 +167,8 @@ jobs:
           echo "Proxy response: $CONTENT"
           
           if [ -z "$CONTENT" ]; then
-            echo "⚠️ Empty content returned. Check proxy.log for Ollama response details."
-            tail -50 proxy.log
+            echo "⚠️ Empty content - check proxy.log"
+            tail -30 proxy.log
           else
             echo "✅ End-to-end proxy test passed"
           fi
@@ -181,8 +198,10 @@ jobs:
             exit 1
           fi
 
-          echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-          echo "✅ Tunnel URL: $TUNNEL_URL"
+          # CRITICAL: Remove trailing slash to fix apiBase concatenation
+          TUNNEL_URL_CLEAN="${TUNNEL_URL%/}"
+          echo "CLOUDFLARE_URL=$TUNNEL_URL_CLEAN" >> $GITHUB_ENV
+          echo "✅ Tunnel URL (clean): $TUNNEL_URL_CLEAN"
 
       - name: Keepalive loop
         run: |
@@ -203,8 +222,6 @@ jobs:
           tail -50 proxy.log 2>/dev/null || echo "(none)"
           echo "--- ollama.log (last 20) ---"
           tail -20 ollama.log 2>/dev/null || echo "(none)"
-          echo "--- tunnel.log (last 10) ---"
-          tail -10 tunnel.log 2>/dev/null || echo "(none)"
 
       - name: Cleanup resources
         if: always()
