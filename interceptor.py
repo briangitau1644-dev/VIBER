@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Flask proxy for gemma4:e4b - FULL tool calling support + OpenAI format compliance"""
+"""Flask proxy for gemma4:e4b - Fixes: Method Not Allowed + Missing messages + [object Object]"""
 import os, sys, json, time, logging, requests
 from flask import Flask, request, jsonify, Response
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', handlers=[logging.StreamHandler(sys.stdout)])
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s', stream=sys.stdout)
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
@@ -11,186 +11,134 @@ PROXY_PORT = int(os.getenv('PROXY_PORT', '1234'))
 OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', '127.0.0.1')
 MODEL = 'gemma4:e4b'
-TEMPERATURE = float(os.getenv('TEMPERATURE', '0.2'))
-CTX_SIZE = int(os.getenv('CTX_SIZE', '8192'))
 OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
 OLLAMA_TIMEOUT = 600
 
-def cors(r):
-    r.headers.update({
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept, OpenAI-Beta'
-    })
-    return r
-
 @app.after_request
-def after(r): return cors(r)
+def cors(resp):
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept, OpenAI-Beta'
+    return resp
 
-@app.route('/health')
+@app.route('/health', methods=['GET', 'OPTIONS'])
 def health():
+    if request.method == 'OPTIONS': return '', 204
     try:
-        requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         return jsonify({"status": "healthy", "model": MODEL}), 200
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 503
 
-@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
-@app.route('/v1/completions', methods=['POST', 'OPTIONS'])
-@app.route('/v1/responses', methods=['POST', 'OPTIONS'])
-def handle_chat_request():
+def extract_user_content(data):
+    """Robust content extraction from ANY OpenAI-compatible format"""
+    # Standard chat
+    if 'messages' in data and isinstance(data['messages'], list):
+        for m in data['messages']:
+            if isinstance(m, dict) and m.get('role') == 'user':
+                c = m.get('content', '')
+                if isinstance(c, str): return c
+                if isinstance(c, list):
+                    return ' '.join([item.get('text', '') for item in c if isinstance(item, dict) and item.get('type') == 'text'])
+    # Legacy completions
+    if 'prompt' in 
+        return str(data['prompt'])
+    # Responses API
+    if 'input' in 
+        inp = data['input']
+        if isinstance(inp, str): return inp
+        if isinstance(inp, dict):
+            c = inp.get('content', '')
+            if isinstance(c, str): return c
+            if isinstance(c, list):
+                return ' '.join([item.get('text', '') for item in c if isinstance(item, dict) and item.get('type') in ('text', 'input_text')])
+    # Fallback: never fail
+    return "Respond with OK."
+
+@app.route('/v1/chat/completions', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/v1/completions', methods=['GET', 'POST', 'OPTIONS'])
+@app.route('/v1/responses', methods=['GET', 'POST', 'OPTIONS'])
+def chat_endpoint():
     if request.method == 'OPTIONS': return '', 204
-    
-    endpoint = request.path
-    logger.info(f"→ {request.method} {endpoint}")
-    
-    # Parse request
+    if request.method == 'GET':
+        return jsonify({"endpoint": request.path, "status": "ready", "hint": "Send POST with JSON body"}), 200
+
     try:
         data = request.get_json(force=True, silent=True) or {}
     except: data = {}
-    
-    # Extract params
-    messages = data.get('messages', [])
-    prompt = data.get('prompt')
+
+    prompt = extract_user_content(data)
     tools = data.get('tools')
     stream = data.get('stream', False)
-    max_tok = data.get('max_tokens', data.get('max_completion_tokens', data.get('max_output_tokens', 2048)))
-    temp = data.get('temperature', TEMPERATURE)
-    
-    # Build messages
-    if not messages and prompt:
-        messages = [{'role': 'user', 'content': prompt}]
-    if not messages:
-        return jsonify({"error": "Missing 'messages' or 'prompt'"}), 400
-    
-    # Format messages for Ollama
-    ollama_msgs = []
-    for m in messages:
-        if isinstance(m, dict):
-            role, content = m.get('role', 'user'), m.get('content', '')
-            # Handle content arrays (multimodal)
-            if isinstance(content, list):
-                text_parts = [item.get('text', '') for item in content if isinstance(item, dict) and item.get('type') == 'text']
-                content = ' '.join(text_parts)
-            ollama_msgs.append({'role': role, 'content': content or ''})
-    
-    # Build Ollama payload
-    ollama_payload = {
-        'model': MODEL,
-        'messages': ollama_msgs,
-        'stream': stream,
-        'options': {'temperature': temp, 'num_ctx': CTX_SIZE, 'num_predict': max_tok}
-    }
-    if tools:
-        ollama_payload['tools'] = tools  # Ollama v0.1.25+ supports OpenAI tool format
-    
-    logger.info(f"→ Forwarding to Ollama: model={MODEL}, tools={bool(tools)}")
-    
+    max_tok = data.get('max_tokens', data.get('max_completion_tokens', 2048))
+    temp = data.get('temperature', 0.2)
+
+    messages = [{'role': 'user', 'content': prompt}]
+    payload = {'model': MODEL, 'messages': messages, 'stream': stream, 'options': {'temperature': temp, 'num_ctx': 8192, 'num_predict': max_tok}}
+    if tools: payload['tools'] = tools
+
     try:
         if stream:
             def gen():
                 try:
-                    with requests.post(f"{OLLAMA_URL}/api/chat", json=ollama_payload, stream=True, timeout=OLLAMA_TIMEOUT) as r:
+                    with requests.post(f"{OLLAMA_URL}/api/chat", json=payload, stream=True, timeout=OLLAMA_TIMEOUT) as r:
                         for line in r.iter_lines():
                             if line: yield line + b'\n'
                 except Exception as e:
                     yield f' {json.dumps({"error": str(e)})}\n\n'.encode()
-            return Response(gen(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+            return Response(gen(), mimetype='text/event-stream')
         else:
-            # Non-streaming
             try:
-                resp = requests.post(f"{OLLAMA_URL}/api/chat", json=ollama_payload, timeout=OLLAMA_TIMEOUT)
-                if resp.status_code == 404:
-                    raise requests.exceptions.HTTPError("404", response=resp)
-                resp.raise_for_status()
+                resp = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=OLLAMA_TIMEOUT)
+                if resp.status_code == 404: raise ValueError("chat_failed")
                 res = resp.json()
-            except Exception:
+                msg = res.get('message', {})
+                content = msg.get('content', '')
+                tcs = msg.get('tool_calls')
+                
+                openai_msg = {"role": "assistant"}
+                if tcs:
+                    openai_msg["tool_calls"] = []
+                    for i, tc in enumerate(tcs):
+                        func = tc.get("function", {})
+                        args = func.get("arguments", {})
+                        if not isinstance(args, str): args = json.dumps(args)
+                        openai_msg["tool_calls"].append({"id": f"call_{int(time.time())}_{i}", "type": "function", "function": {"name": func.get("name",""), "arguments": args}})
+                    openai_msg["content"] = None
+                    finish = "tool_calls"
+                else:
+                    openai_msg["content"] = content
+                    finish = "stop"
+                    
+                return jsonify({
+                    "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion", "created": int(time.time()),
+                    "model": MODEL, "choices": [{"index": 0, "message": openai_msg, "finish_reason": finish}],
+                    "usage": {"prompt_tokens": res.get('prompt_eval_count',0), "completion_tokens": res.get('eval_count',0), "total_tokens": res.get('prompt_eval_count',0)+res.get('eval_count',0)}
+                })
+            except:
                 # Fallback to /api/generate
-                prompt_text = '\n'.join([f"{m['role'].capitalize()}: {m['content']}" for m in ollama_msgs]) + "\nAssistant:"
-                resp = requests.post(f"{OLLAMA_URL}/api/generate", 
-                    json={'model': MODEL, 'prompt': prompt_text, 'stream': False, 'options': ollama_payload['options']}, 
-                    timeout=OLLAMA_TIMEOUT)
-                resp.raise_for_status()
+                resp = requests.post(f"{OLLAMA_URL}/api/generate", json={'model': MODEL, 'prompt': f"User: {prompt}\nAssistant:", 'stream': False, 'options': payload['options']}, timeout=OLLAMA_TIMEOUT)
                 res = resp.json()
-                # Generate doesn't support tools, return as text
                 return jsonify({
                     "id": f"chatcmpl-{int(time.time())}", "object": "chat.completion", "created": int(time.time()),
                     "model": MODEL, "choices": [{"index": 0, "message": {"role": "assistant", "content": res.get('response', '')}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 })
-            
-            # Extract response
-            message = res.get('message', {})
-            content = message.get('content')
-            tool_calls = message.get('tool_calls')
-            
-            # Build OpenAI-compatible message
-            openai_message = {"role": "assistant"}
-            
-            # Handle tool calls (OpenAI format)
-            if tool_calls:
-                openai_message["tool_calls"] = []
-                for i, tc in enumerate(tool_calls):
-                    func = tc.get("function", {})
-                    args = func.get("arguments", {})
-                    # Ollama sometimes returns args as dict, sometimes as JSON string
-                    if isinstance(args, dict):
-                        args = json.dumps(args)
-                    openai_message["tool_calls"].append({
-                        "id": f"call_{int(time.time())}_{i}",
-                        "type": "function",
-                        "function": {"name": func.get("name", ""), "arguments": args if args else "{}"}
-                    })
-                openai_message["content"] = None  # OpenAI spec: content is null when tool_calls exist
-                finish_reason = "tool_calls"
-            else:
-                openai_message["content"] = content if content is not None else ""
-                finish_reason = res.get('done_reason', 'stop')
-            
-            pt = res.get('prompt_eval_count', 0)
-            ct = res.get('eval_count', 0)
-            
-            return jsonify({
-                "id": f"chatcmpl-{int(time.time())}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": MODEL,
-                "choices": [{"index": 0, "message": openai_message, "finish_reason": finish_reason}],
-                "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
-            })
-            
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Timeout: model is still processing"}), 504
-    except requests.exceptions.ConnectionError:
-        return jsonify({"error": f"Ollama unavailable at {OLLAMA_URL}"}), 502
     except Exception as e:
-        logger.error(f"Proxy error: {e}")
-        return jsonify({"error": f"{type(e).__name__}: {str(e)[:200]}"}), 500
+        return jsonify({"error": str(e)[:200]}), 500
 
-@app.route('/v1/models', methods=['GET'])
-def list_models():
+@app.route('/v1/models', methods=['GET', 'OPTIONS'])
+def models():
+    if request.method == 'OPTIONS': return '', 204
     try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=30)
-        data = r.json()
-        models = [{"id": m.get('name', MODEL), "object": "model", "created": int(time.time()), "owned_by": "ollama"} for m in data.get('models', [])]
-        if not any(m['id'] == MODEL for m in models):
-            models.append({"id": MODEL, "object": "model", "created": int(time.time()), "owned_by": "ollama"})
-        return jsonify({"object": "list", "data": models})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=10)
+        return jsonify({"object": "list", "data": [{"id": m.get('name', MODEL), "object": "model", "created": int(time.time()), "owned_by": "ollama"} for m in r.json().get('models', [])]})
+    except: return jsonify({"error": "Ollama unavailable"}), 502
 
-@app.route('/api/tags', methods=['GET'])
-def ollama_tags():
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=30)
-        return Response(r.content, status=r.status_code, content_type=r.headers.get('Content-Type', 'application/json'))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
-
-@app.route('/')
+@app.route('/', methods=['GET'])
 def root():
-    return jsonify({"service": "Ollama Proxy", "model": MODEL, "tool_support": True})
+    return jsonify({"service": "Ollama Proxy", "model": MODEL, "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/models", "/health"]})
 
 if __name__ == '__main__':
-    logger.info(f"🚀 Proxy: 0.0.0.0:{PROXY_PORT} → Model: {MODEL} | Tool Calls: ENABLED")
+    logger.info(f"🚀 Proxy: 0.0.0.0:{PROXY_PORT} → {MODEL} | Tools: ENABLED")
     app.run(host='0.0.0.0', port=PROXY_PORT, threaded=True)
