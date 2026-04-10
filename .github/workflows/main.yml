@@ -26,14 +26,14 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  MODEL_FILENAME: ${{ github.event.inputs.model_filename }}
   MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
-  MODEL_FILENAME: ${{ github.event.inputs.model_filename || 'google_gemma-4-E4B-it-Q4_K_M.gguf' }}
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
   CTX_SIZE: ${{ github.event.inputs.ctx_size || '4096' }}
   N_GPU_LAYERS: ${{ github.event.inputs.n_gpu_layers || '0' }}
   SERVER_PORT: '1234'
   SERVER_HOST: '0.0.0.0'
-  MODEL_PATH: 'models/${{ github.event.inputs.model_filename || "google_gemma-4-E4B-it-Q4_K_M.gguf" }}'
+  MODEL_PATH: models/${{ github.event.inputs.model_filename }}
 
 jobs:
   lm-studio-direct:
@@ -97,23 +97,21 @@ jobs:
           mkdir -p models
           
           echo "⏳ Attempting to download model..."
-          echo "   URL: ${{ env.MODEL_DOWNLOAD_URL }}"
-          echo "   Save as: ${{ env.MODEL_FILENAME }}"
+          echo "   URL: $MODEL_DOWNLOAD_URL"
+          echo "   Save as: $MODEL_FILENAME"
           
-          # Attempt download with retry logic
           DOWNLOAD_SUCCESS=false
           for attempt in 1 2 3; do
             echo "🔄 Download attempt $attempt/3..."
             
             if curl -fL --retry 2 --retry-delay 10 --connect-timeout 30 --max-time 600 \
-              -o "${{ env.MODEL_PATH }}" \
-              "${{ env.MODEL_DOWNLOAD_URL }}" 2>&1; then
+              -o "$MODEL_PATH" \
+              "$MODEL_DOWNLOAD_URL" 2>&1; then
               
-              # Verify file exists and has content
-              if [ -f "${{ env.MODEL_PATH }}" ] && [ -s "${{ env.MODEL_PATH }}" ]; then
-                FILE_SIZE=$(du -h "${{ env.MODEL_PATH }}" | cut -f1)
+              if [ -f "$MODEL_PATH" ] && [ -s "$MODEL_PATH" ]; then
+                FILE_SIZE=$(du -h "$MODEL_PATH" | cut -f1)
                 echo "✅ Model downloaded successfully: $FILE_SIZE"
-                ls -lh "${{ env.MODEL_PATH }}"
+                ls -lh "$MODEL_PATH"
                 DOWNLOAD_SUCCESS=true
                 break
               fi
@@ -123,7 +121,6 @@ jobs:
             sleep 5
           done
           
-          # If all attempts failed, provide helpful error with prompt for new URL
           if [ "$DOWNLOAD_SUCCESS" = false ]; then
             echo ""
             echo "╔════════════════════════════════════════════════════════════════╗"
@@ -134,7 +131,7 @@ jobs:
             echo "║                                                                  ║"
             echo "║  🔗 To fix:                                                      ║"
             echo "║    1. Get a fresh direct download link from HuggingFace:        ║"
-            echo "║       • Go to: https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF ║"
+            echo "║       • Go to: https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF"
             echo "║       • Click the GGUF file you want                             ║"
             echo "║       • Click 'Download' → copy the URL from your browser       ║"
             echo "║       • OR right-click 'Download' → 'Copy link address'         ║"
@@ -144,11 +141,10 @@ jobs:
             echo "║       • Paste the new URL in 'model_download_url' field         ║"
             echo "║                                                                  ║"
             echo "║  📋 Current attempted URL:                                       ║"
-            printf "║    %-63s║\n" "${{ env.MODEL_DOWNLOAD_URL }}"
+            echo "║    $MODEL_DOWNLOAD_URL                                           ║"
             echo "║                                                                  ║"
-            echo "║  💡 Tip: HuggingFace direct links may expire. Use the 'resolve' ║"
-            echo "║     format for stable links:                                    ║"
-            echo "║     https://huggingface.co/<repo>/resolve/main/<file>?download=true ║"
+            echo "║  💡 Tip: Use the 'resolve' format for stable links:             ║"
+            echo "║     https://huggingface.co/<repo>/resolve/main/<file>?download=true"
             echo "║                                                                  ║"
             echo "╚════════════════════════════════════════════════════════════════╝"
             echo ""
@@ -166,17 +162,17 @@ jobs:
           fi
           
           echo "🚀 Starting llama.cpp server..."
-          echo "   Model: ${{ env.MODEL_PATH }}"
-          echo "   Port: ${{ env.SERVER_PORT }}"
-          echo "   Context: ${{ env.CTX_SIZE }} tokens"
-          echo "   GPU layers: ${{ env.N_GPU_LAYERS }}"
+          echo "   Model: $MODEL_PATH"
+          echo "   Port: $SERVER_PORT"
+          echo "   Context: $CTX_SIZE tokens"
+          echo "   GPU layers: $N_GPU_LAYERS"
           
           nohup $SERVER_BIN \
-            --model "../${{ env.MODEL_PATH }}" \
-            --host "${{ env.SERVER_HOST }}" \
-            --port "${{ env.SERVER_PORT }}" \
-            --ctx-size "${{ env.CTX_SIZE }}" \
-            --n-gpu-layers ${{ env.N_GPU_LAYERS }} \
+            --model "../$MODEL_PATH" \
+            --host "$SERVER_HOST" \
+            --port "$SERVER_PORT" \
+            --ctx-size "$CTX_SIZE" \
+            --n-gpu-layers "$N_GPU_LAYERS" \
             --chat-template gemma \
             --slots \
             --log-disable \
@@ -186,7 +182,7 @@ jobs:
           echo "⏳ Waiting for server to be ready..."
           
           for i in {1..60}; do
-            if curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/health" > /dev/null 2>&1; then
+            if curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
               echo "✅ Server ready after ${i} attempts"
               break
             fi
@@ -200,7 +196,7 @@ jobs:
           done
           
           echo "📦 Testing /v1/models endpoint..."
-          curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/v1/models" | jq . || echo "(no models endpoint)"
+          curl -sf "http://127.0.0.1:$SERVER_PORT/v1/models" | jq . || echo "(no models endpoint)"
 
       - name: 📥 Install Cloudflared
         run: |
@@ -217,7 +213,7 @@ jobs:
           sleep 2
 
           nohup cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.SERVER_PORT }} \
+            --url http://127.0.0.1:$SERVER_PORT \
             --no-autoupdate \
             --loglevel info \
             > tunnel.log 2>&1 &
@@ -263,12 +259,12 @@ jobs:
             echo "║   🦙  LM STUDIO DIRECT — gemma-4-e4b — READY                   ║"
             echo "╠════════════════════════════════════════════════════════════════╣"
             printf "║  Tunnel URL: %-52s║\n" "${TUNNEL_URL}"
-            printf "║  Model:      %-52s║\n" "${{ env.MODEL_FILENAME }}"
+            printf "║  Model:      %-52s║\n" "$MODEL_FILENAME"
             echo "║                                                                  ║"
             echo "║  ✅ USE THIS IN LM STUDIO / CONTINUE / ROO CODE:                ║"
             echo "║                                                                  ║"
             printf "║    Server URL: %-52s║\n" "${TUNNEL_URL}"
-            printf "║    Model ID:   %-52s║\n" "${{ env.MODEL_FILENAME }}"
+            printf "║    Model ID:   %-52s║\n" "$MODEL_FILENAME"
             echo "║                                                                  ║"
             echo "║  ✅ OpenAI-Compatible Endpoints:                                ║"
             echo "║    • GET  /v1/models             — List models                  ║"
@@ -282,7 +278,7 @@ jobs:
             echo "╚════════════════════════════════════════════════════════════════╝"
             echo ""
             echo "==> Server URL: ${TUNNEL_URL}"
-            echo "==> Model ID:   ${{ env.MODEL_FILENAME }}"
+            echo "==> Model ID:   $MODEL_FILENAME"
           fi
 
       - name: 🧪 Test OpenAI-Compatible Endpoints
@@ -350,7 +346,7 @@ jobs:
           echo ""
 
           echo "3️⃣  POST /v1/chat/completions"
-          DATA='{"model":"${{ env.MODEL_FILENAME }}","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
+          DATA='{"model":"'"$MODEL_FILENAME"'","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
           R=$(do_post "${BASE}/v1/chat/completions" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
           check "POST /v1/chat/completions" "$B" "$CODE"
           echo "$B" | jq '{finish:.choices[0].finish_reason, reply:.choices[0].message.content}' 2>/dev/null || true
@@ -363,8 +359,8 @@ jobs:
 
       - name: ⏱️ Session Keepalive (${{ env.SESSION_HOURS }}h)
         run: |
-          SESSION_SECONDS=$(( ${{ env.SESSION_HOURS }} * 3600 ))
-          echo "⏱️  Session: ${SESSION_SECONDS}s (${{ env.SESSION_HOURS }}h)"
+          SESSION_SECONDS=$(( $SESSION_HOURS * 3600 ))
+          echo "⏱️  Session: ${SESSION_SECONDS}s ($SESSION_HOURS h)"
 
           RAW_URL="${{ env.CLOUDFLARE_URL }}"
           CF_URL="${RAW_URL//__/}"
@@ -387,7 +383,7 @@ jobs:
               echo "🟢 Server via tunnel: ${MODELS:-unreachable}"
             fi
 
-            HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:${{ env.SERVER_PORT }}/health" 2>/dev/null || echo '{"status":"down"}')
+            HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null || echo '{"status":"down"}')
             echo "🟢 Server local: $(echo "$HEALTH" | jq -r .status 2>/dev/null || echo unreachable)"
 
             SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "./server" || true)
@@ -402,11 +398,11 @@ jobs:
                 SERVER_BIN="./server"
               fi
               nohup $SERVER_BIN \
-                --model "../${{ env.MODEL_PATH }}" \
-                --host "${{ env.SERVER_HOST }}" \
-                --port "${{ env.SERVER_PORT }}" \
-                --ctx-size "${{ env.CTX_SIZE }}" \
-                --n-gpu-layers ${{ env.N_GPU_LAYERS }} \
+                --model "../$MODEL_PATH" \
+                --host "$SERVER_HOST" \
+                --port "$SERVER_PORT" \
+                --ctx-size "$CTX_SIZE" \
+                --n-gpu-layers "$N_GPU_LAYERS" \
                 --chat-template gemma \
                 --slots \
                 --log-disable \
@@ -439,7 +435,7 @@ jobs:
 
           echo ""
           echo "── Local Server Health ──"
-          curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/health" 2>/dev/null | jq . || echo "unreachable"
+          curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "unreachable"
 
           echo ""
           echo "── server.log (last 30 lines) ──"
@@ -458,6 +454,6 @@ jobs:
           pkill -9 -f cloudflared 2>/dev/null || true
           pkill -9 -f "llama.cpp.*server" 2>/dev/null || true
           pkill -9 -f "./server" 2>/dev/null || true
-          sudo fuser -k ${{ env.SERVER_PORT }}/tcp 2>/dev/null || true
+          sudo fuser -k $SERVER_PORT/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
           echo "✅ Done"
