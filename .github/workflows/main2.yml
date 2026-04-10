@@ -56,19 +56,12 @@ jobs:
 
       - name: Install latest Ollama (Linux)
         run: |
-          # Remove any pre-installed ollama
           sudo rm -f /usr/local/bin/ollama
           sudo rm -rf /usr/share/ollama /etc/ollama
-          
-          # Install latest version with force flag
           echo "📦 Installing latest Ollama for Linux..."
           curl -fsSL https://ollama.com/install.sh | sh -s -- --force
-          
-          # Verify installation
           ollama --version
           echo "✅ Ollama installed"
-          
-          # Pre-start check
           if ! command -v ollama &> /dev/null; then
             echo "❌ ERROR: ollama command not found after install"
             exit 1
@@ -116,12 +109,10 @@ jobs:
       - name: Warm up model (dual endpoint)
         run: |
           echo "🔥 Warming up $MODEL..."
-          # Try /api/chat first
           curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/chat" \
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":3}}" \
             --max-time 300 > /dev/null 2>&1 || \
-          # Fallback to /api/generate
           curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/generate" \
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$MODEL\",\"prompt\":\"hi\",\"stream\":false,\"options\":{\"num_predict\":3}}" \
@@ -134,19 +125,16 @@ jobs:
             echo "❌ ERROR: interceptor.py not found in repository root!"
             exit 1
           fi
-
           echo "🚀 Starting proxy on port $PROXY_PORT..."
           python3 interceptor.py > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 3
-
           if ! kill -0 $(cat proxy.pid) 2>/dev/null; then
             echo "❌ Proxy crashed on startup!"
             cat proxy.log
             exit 1
           fi
           echo "✅ Proxy alive (PID: $(cat proxy.pid))"
-          
           echo "⏳ Waiting for /health endpoint..."
           for i in $(seq 1 20); do
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PROXY_PORT/health" --max-time 5 2>/dev/null)
@@ -169,10 +157,8 @@ jobs:
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply: OK\"}],\"max_tokens\":10}" \
             --max-time 120)
-          
           CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
           echo "Proxy response: $CONTENT"
-          
           if [ -z "$CONTENT" ]; then
             echo "⚠️ Empty content - check proxy.log"
             tail -30 proxy.log
@@ -216,11 +202,8 @@ jobs:
           # Export clean URL (no trailing slash)
           echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
           
-          # === ROBUST TUNNEL VERIFICATION (handles exit code 6) ===
+          # === ROBUST TUNNEL VERIFICATION ===
           echo "🔍 Verifying tunnel connectivity..."
-          
-          # Step 1: DNS resolution check
-          echo "  Step 1: DNS resolution..."
           DNS_HOST=$(echo "$TUNNEL_URL" | sed 's|https://||')
           for i in $(seq 1 20); do
             if nslookup "$DNS_HOST" > /dev/null 2>&1 || getent hosts "$DNS_HOST" > /dev/null 2>&1; then
@@ -231,19 +214,14 @@ jobs:
             sleep 2
           done
           
-          # Step 2: HTTP health check with curl error handling
           echo "  Step 2: HTTP health check..."
           TUNNEL_OK=false
           for i in $(seq 1 30); do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
               "$TUNNEL_URL/health" \
-              --max-time 20 \
-              --connect-timeout 10 \
-              --retry 2 \
-              --retry-delay 2 \
+              --max-time 20 --connect-timeout 10 --retry 2 --retry-delay 2 \
               2>/dev/null)
             CURL_EXIT=$?
-            
             if [ "$CURL_EXIT" -eq 0 ] && [ "$HTTP_CODE" = "200" ]; then
               echo "  ✅ Tunnel verified (HTTP $HTTP_CODE)"
               TUNNEL_OK=true
@@ -259,10 +237,9 @@ jobs:
             fi
             sleep 3
           done
-          
           [ "$TUNNEL_OK" = false ] && echo "  ⚠️ Health check didn't return 200, but tunnel may still work"
 
-          # Print client configuration
+          # === BOXED CLIENT CONFIG ===
           echo ""
           echo "╔════════════════════════════════════════════════════╗"
           echo "║  🎉 gemma4:e4b + Ollama READY                      ║"
@@ -280,6 +257,20 @@ jobs:
           echo "║  ⚠️  IMPORTANT: Base URL must have NO trailing /  ║"
           echo "╚════════════════════════════════════════════════════╝"
 
+          # === COPY-PASTE READY CLIENT CONFIG ===
+          echo ""
+          echo "📋 === COPY THIS EXACTLY INTO YOUR CLIENT ==="
+          echo "{"
+          echo "  \"provider\": \"openai\","
+          echo "  \"baseUrl\": \"${TUNNEL_URL}/v1\","
+          echo "  \"model\": \"$MODEL\","
+          echo "  \"apiKey\": \"roo\""
+          echo "}"
+          echo "=== END CONFIG ==="
+          echo ""
+          echo "⚠️  DO NOT add trailing slash to baseUrl!"
+          echo "⚠️  DO NOT use provider: 'ollama' - use 'openai'!"
+
       - name: Smoke test via tunnel
         if: env.CLOUDFLARE_URL != ''
         run: |
@@ -289,10 +280,8 @@ jobs:
             -H "Authorization: Bearer roo" \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Write one word: TEST\"}],\"max_tokens\":10}" \
             --max-time 90 2>/dev/null)
-          
           CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
           echo "Tunnel response: '$CONTENT'"
-          
           if [ -n "$CONTENT" ]; then
             echo "✅ Smoke test passed"
           else
