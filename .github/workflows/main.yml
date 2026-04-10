@@ -1,16 +1,14 @@
-# .github/workflows/qwen-coder-roo.yml
+# .github/workflows/main.yml
 name: Roo Code - Qwen2.5-Coder 7B Server
 
 on:
   workflow_dispatch:
 
 env:
-  # Future-proofing Node version for GitHub Actions
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   
   # === MODEL CONFIGURATION ===
-  # Using Qwen2.5-Coder 7B (Q4_K_M) - Optimized for GitHub Actions (7GB RAM limit)
-  # If you have a self-hosted runner with 16GB+ RAM, switch to the 14B version.
+  # Qwen2.5-Coder-7B-Instruct (Q4_K_M) - Best coding performance for GitHub Actions RAM
   MODEL_URL: 'https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf'
   MODEL_PATH: 'models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf'
   MODEL_FILENAME: 'Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf'
@@ -58,7 +56,7 @@ jobs:
           git clone --depth 1 --branch "${LLAMA_BRANCH}" "${LLAMA_REPO}"
           cd llama.cpp
           
-          echo "🔨 Configuring cmake build for Qwen..."
+          echo "🔨 Configuring cmake build..."
           cmake -B build \
             -DLLAMA_CURL=ON \
             -DLLAMA_BUILD_SERVER=ON \
@@ -81,10 +79,6 @@ jobs:
         run: |
           mkdir -p models
           echo "📦 Downloading Qwen2.5-Coder-7B (~4.5GB)..."
-          echo "   Model: ${MODEL_FILENAME}"
-          echo "   Context: 32768 tokens (Roo Code compatible)"
-          
-          # Download with retries for large file
           curl -fL --retry 3 --retry-delay 10 --connect-timeout 30 --max-time 1200 \
             -o "${MODEL_PATH}" \
             "${MODEL_URL}"
@@ -99,35 +93,31 @@ jobs:
 
       - name: Start llama-server with ROO CODE COMPATIBLE settings
         run: |
-          echo "🚀 Starting llama-server with Qwen2.5-Coder..."
-          echo "   Context: 32768 (Required for Roo Code)"
-          echo "   Chat Template: qwen2.5"
+          echo "🚀 Starting llama-server..."
           
           $SERVER_BIN \
             --model "${MODEL_PATH}" \
             --port ${{ env.SERVER_PORT }} \
-            --ctx-size 32768 \        # ✅ CRITICAL: Roo Code needs 8K+ context
+            --ctx-size 32768 \
             --threads $(nproc) \
-            --chat-template qwen2.5 \  # ✅ Required for Qwen instruction models
+            --chat-template qwen2.5 \
             --n-predict 4096 \
             --batch-size 2048 \
             --ubatch-size 512 \
             --log-disable \
-            --no-mmap \                # Helps prevent RAM issues on CI runners
+            --no-mmap \
             &
           
           SERVER_PID=$!
           echo "SERVER_PID=${SERVER_PID}" >> $GITHUB_ENV
           
-          # Health check loop
           echo "⏳ Waiting for server initialization..."
           for i in {1..40}; do
             if curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" | grep -qE '"status"|"ok"'; then
               echo "✅ Server is UP and healthy!"
               break
             fi
-            [ $i -eq 40 ] && { echo "❌ Server failed to start within timeout"; exit 1; }
-            echo "   Waiting... ($i/40)"
+            [ $i -eq 40 ] && { echo "❌ Server failed to start"; exit 1; }
             sleep 5
           done
 
@@ -135,57 +125,34 @@ jobs:
         run: |
           echo "🔗 Creating proxy with full HTTP method support..."
           
-          # Write proxy.py to disk using cat to avoid YAML syntax errors
+          # Write proxy.py to disk
           cat > proxy.py << 'PYEOF'
 #!/usr/bin/env python3
-import http.server
-import urllib.request
-import urllib.parse
-import json
-import os
-import sys
+import http.server, urllib.request, urllib.parse, json, os
 
 SERVER_PORT = os.environ.get('SERVER_PORT', '1234')
 PROXY_PORT = int(os.environ.get('PROXY_PORT', '11434'))
 BACKEND_URL = f"http://localhost:{SERVER_PORT}"
 
-# Roo Code / Senior Engineer System Prompt
-SYSTEM_PROMPT = (
-    "You are an expert Senior Full-Stack Engineer. "
-    "Write clean, production-ready code following best practices. "
-    "Include type hints, error handling, and documentation. "
-    "No explanations unless explicitly asked. No placeholders or TODOs. "
-    "Use modern syntax (Python 3.11+, TypeScript 5+, etc.)."
-)
+SYSTEM_PROMPT = "You are an expert Senior Full-Stack Engineer. Write clean, production-ready code. Include type hints and error handling. No placeholders."
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     
-    def log_message(self, format, *args):
-        # Suppress logs for cleaner CI output
-        if os.environ.get('DEBUG_PROXY'):
-            print(f"[PROXY] {args[0]}", file=sys.stderr)
-        pass
-
-    def _send_cors(self):
+    def log_message(self, *args): pass
+    
+    def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
 
     def _forward_request(self, method, path, body=None):
-        """Forward request to llama-server backend"""
         target_url = f"{BACKEND_URL}{path}"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
-        
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
         data = body.encode('utf-8') if body else None
-        if data:
+        if 
             headers["Content-Length"] = str(len(data))
-        
         req = urllib.request.Request(target_url, data=data, headers=headers, method=method)
-        
         try:
             with urllib.request.urlopen(req, timeout=180) as response:
                 return response.getcode(), response.read(), dict(response.headers)
@@ -193,101 +160,55 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return e.code, e.read(), dict(e.headers)
 
     def _send_response(self, code, body, headers=None):
-        """Send HTTP response to client"""
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
         if headers:
             for k, v in headers.items():
-                if k.lower() not in ['content-type', 'content-length', 'transfer-encoding']:
+                if k.lower() not in ['content-type', 'content-length']:
                     self.send_header(k, v)
-        self._send_cors()
+        self._cors()
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
-        """Handle CORS preflight"""
         self.send_response(200)
-        self._send_cors()
+        self._cors()
         self.end_headers()
 
     def do_GET(self):
-        """Handle GET requests - Fixes 501 error"""
-        parsed = urllib.parse.urlparse(self.path)
-        path = parsed.path
-        
-        # Handle proxy-specific endpoints
+        path = urllib.parse.urlparse(self.path).path
         if path == '/' or path == '/health':
-            response = json.dumps({
-                "status": "ok",
-                "proxy": "running",
-                "backend": BACKEND_URL,
-                "model": "Qwen2.5-Coder-7B-Instruct"
-            })
-            self._send_response(200, response.encode())
+            self._send_response(200, json.dumps({"status": "ok", "model": "qwen2.5-coder-7b"}).encode())
             return
-        
-        if path == '/api/tags' or path == '/v1/models':
-            response = json.dumps({
-                "models": [{
-                    "id": "qwen2.5-coder-7b",
-                    "name": "Qwen 2.5 Coder 7B",
-                    "object": "model",
-                    "created": 1704067200,
-                    "owned_by": "qwen",
-                    "quantization": "Q4_K_M",
-                    "context_length": 32768
-                }]
-            })
-            self._send_response(200, response.encode())
+        if path == '/v1/models' or path == '/api/tags':
+            self._send_response(200, json.dumps({"models": [{"id": "qwen2.5-coder-7b", "object": "model", "owned_by": "qwen", "context_length": 32768}]}).encode())
             return
-        
-        # Forward other GET requests to backend
         try:
-            code, body, resp_headers = self._forward_request('GET', path)
-            self._send_response(code, body, resp_headers)
+            code, body, hdrs = self._forward_request('GET', path)
+            self._send_response(code, body, hdrs)
         except Exception as e:
             self._send_response(500, json.dumps({"error": str(e)}).encode())
 
     def do_POST(self):
-        """Handle POST requests with system prompt injection"""
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length)
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length)
             data = json.loads(body) if body else {}
             
-            # Inject system prompt for chat endpoints
             if "messages" in data and not any(m.get("role") == "system" for m in data["messages"]):
                 data["messages"].insert(0, {"role": "system", "content": SYSTEM_PROMPT})
             
-            # Forward to backend
-            code, response_body, resp_headers = self._forward_request(
-                'POST', self.path, json.dumps(data)
-            )
+            code, response_body, resp_headers = self._forward_request('POST', self.path, json.dumps(data))
             self._send_response(code, response_body, resp_headers)
-            
         except Exception as e:
             self._send_response(500, json.dumps({"error": str(e)}).encode())
 
-    def do_HEAD(self):
-        """Handle HEAD requests"""
-        try:
-            code, _, resp_headers = self._forward_request('HEAD', self.path)
-            self.send_response(code)
-            for k, v in resp_headers.items():
-                self.send_header(k, v)
-            self._send_cors()
-            self.end_headers()
-        except:
-            self.send_response(500)
-            self.end_headers()
-
 if __name__ == "__main__":
-    print(f"🔗 Proxy starting on 0.0.0.0:{PROXY_PORT} -> {BACKEND_URL}")
-    print(f"✅ Supported methods: GET, POST, HEAD, OPTIONS")
+    print(f"🔗 Proxy: 0.0.0.0:{PROXY_PORT} -> {BACKEND_URL}", flush=True)
     http.server.HTTPServer(('0.0.0.0', PROXY_PORT), ProxyHandler).serve_forever()
 PYEOF
-
+          
           chmod +x proxy.py
           python3 proxy.py &
           PROXY_PID=$!
@@ -298,83 +219,40 @@ PYEOF
       - name: Download and start cloudflared tunnel
         run: |
           echo "🌐 Setting up Cloudflare Tunnel..."
-          
-          # Download cloudflared
           curl -fL --retry 3 -o cloudflared \
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
-          echo "✅ Cloudflared downloaded"
           
-          # Start tunnel - capture BOTH stdout and stderr
           ./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate > tunnel.log 2>&1 &
           TUNNEL_PID=$!
           echo "TUNNEL_PID=${TUNNEL_PID}" >> $GITHUB_ENV
           
-          # Wait for tunnel to establish with robust URL extraction
-          echo "⏳ Waiting for tunnel URL (max 45 seconds)..."
+          echo "⏳ Waiting for tunnel URL..."
           PUBLIC_URL=""
-          
           for i in {1..15}; do
-            # Method 1: Parse from log file
             if [ -f tunnel.log ]; then
               PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n1) || true
             fi
-            
-            # Method 2: Query cloudflared metrics endpoint
             if [ -z "$PUBLIC_URL" ]; then
-              PUBLIC_URL=$(curl -sf "http://localhost:45678/metrics" 2>/dev/null | \
-                grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -n1) || true
+              PUBLIC_URL=$(curl -sf "http://localhost:45678/metrics" 2>/dev/null | grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -n1) || true
             fi
-            
-            # Verify URL works
-            if [ -n "$PUBLIC_URL" ]; then
-              if curl -sf --max-time 5 "$PUBLIC_URL/health" >/dev/null 2>&1; then
-                echo "✅ Verified tunnel URL is responding"
-                break
-              fi
-            fi
-            
-            [ $i -lt 15 ] && echo "   Waiting... ($i/15)" && sleep 3
+            if [ -n "$PUBLIC_URL" ]; then break; fi
+            sleep 3
           done
           
-          # Display results
           if [ -n "$PUBLIC_URL" ]; then
-            echo ""
-            echo "╔════════════════════════════════════════╗"
-            echo "║  🎉 Qwen2.5-Coder API is LIVE!        ║"
-            echo "╠════════════════════════════════════════╣"
-            echo "║  🔗 ${PUBLIC_URL}║"
-            echo "║  💬 Chat: ${PUBLIC_URL}/v1/chat/completions║"
-            echo "║  🤖 Ollama: ${PUBLIC_URL}/api/chat     ║"
-            echo "║  ✅ Health: ${PUBLIC_URL}/health       ║"
-            echo "╚════════════════════════════════════════╝"
-            echo ""
+            echo "🎉 API URL: ${PUBLIC_URL}"
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_ENV
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_STEP_SUMMARY
-            echo "::notice::Your API is available at: ${PUBLIC_URL}"
           else
-            echo "⚠️  Could not auto-detect tunnel URL"
-            echo "📋 Last 20 lines of tunnel.log:"
-            tail -20 tunnel.log 2>/dev/null || echo "(no log file)"
+            echo "⚠️ URL not detected. Check tunnel.log"
+            tail -10 tunnel.log 2>/dev/null || true
           fi
 
       - name: Keep workflow alive
         run: |
-          echo "⏱️  Keeping tunnel alive for 6 hours..."
+          echo "⏱️  Keeping tunnel alive (6 hours)..."
           for i in {1..720}; do
-            # Check backend health
-            if ! curl -sf --max-time 10 "http://localhost:${{ env.SERVER_PORT }}/health" >/dev/null 2>&1; then
-              echo "⚠️  Backend health check failed at iteration $i"
-            fi
-            
-            # Check tunnel process
-            if ! ps -p ${TUNNEL_PID:-0} >/dev/null 2>&1; then
-              echo "⚠️  Tunnel process died, restarting..."
-              ./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate > tunnel.log 2>&1 &
-              TUNNEL_PID=$!
-              sleep 10
-            fi
-            
+            curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" >/dev/null 2>&1 || echo "⚠️ Backend health check failed ($i)"
             sleep 30
           done
-          echo "✅ Workflow session completed"
