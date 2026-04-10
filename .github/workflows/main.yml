@@ -1,6 +1,3 @@
-<layout>
-    # domains_identified: [Local]
-</layout>
 name: Senior Engineer CPU - Gemma4-E4B - GitHub Actions
 
 on:
@@ -21,11 +18,11 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL_FILENAME: ${{ github.event.inputs.model_filename }}
-  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
-  SESSION_HOURS: ${{ github.event.inputs.session_hours }}
-  SERVER_PORT: '8080' # Internal llama-server port
-  BACKEND_PORT: '11434' # Public proxy port (Ollama default)
+  MODEL_FILENAME: ${{ github.event.inputs.model_filename || 'google_gemma-4-E4B-it-bf16.gguf' }}
+  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url || 'https://huggingface.co' }}
+  SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
+  SERVER_PORT: '8080'
+  BACKEND_PORT: '11434'
   MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
 
 jobs:
@@ -53,7 +50,7 @@ jobs:
 
       - name: Clone and Build llama.cpp
         run: |
-          git clone --depth 1 https://github.com/ggerganov/llama.cpp
+          git clone --depth 1 https://github.com
           cd llama.cpp
           cmake -B build -DLLAMA_CURL=ON -DLLAMA_BUILD_SERVER=ON -DCMAKE_BUILD_TYPE=Release
           cmake --build build --config Release -j$(nproc)
@@ -66,44 +63,51 @@ jobs:
 
       - name: Start Llama Server
         run: |
-          # Use --chat-template to ensure the model follows Gemma's specific structure
           $SERVER_BIN \
             --model "$MODEL_PATH" \
             --port ${{ env.SERVER_PORT }} \
             --ctx-size 8192 \
             --threads $(nproc) \
             --chat-template gemma &
-          
-          sleep 10
+          sleep 15
 
       - name: Start Ollama-Style Wrapper Proxy
         run: |
-          # This script acts as the "Modelfile" by injecting the persona into every request
           cat << 'PYEOF' > proxy.py
-          import http.server, urllib.request, json, os
+          import http.server, urllib.request, json
 
-          SYSTEM_PROMPT = "You are a Senior Full-Stack Engineer (15+ years exp). Expert in Python Django, React, and DevOps. Provide complete code, no placeholders, and a professional tone."
+          SYSTEM_PROMPT = (
+              "You are a Senior Full-Stack Engineer (15+ years exp). "
+              "Expert in Python Django, React, and DevOps. "
+              "Provide complete code, no placeholders, and a professional tone."
+          )
 
           class ProxyHandler(http.server.BaseHTTPRequestHandler):
               def do_POST(self):
                   content_length = int(self.headers['Content-Length'])
                   body = json.loads(self.rfile.read(content_length))
                   
-                  # Replicate Ollama's behavior: Ensure the system prompt is always present
-                  if "messages" in body:
-                      if body["messages"][0]["role"] != "system":
+                  # Replicate Ollama's Modelfile 'SYSTEM' instruction injection
+                  if "messages" in body and isinstance(body["messages"], list):
+                      # Check if system prompt is already there; if not, insert it
+                      if not any(m.get("role") == "system" for m in body["messages"]):
                           body["messages"].insert(0, {"role": "system", "content": SYSTEM_PROMPT})
                   
-                  req = urllib.request.Request(
-                      "http://localhost:8080/v1/chat/completions",
-                      data=json.dumps(body).encode(),
-                      headers={"Content-Type": "application/json"}
-                  )
-                  with urllib.request.urlopen(req) as res:
-                      self.send_response(res.getcode())
-                      self.send_header("Content-Type", "application/json")
+                  try:
+                      req = urllib.request.Request(
+                          "http://localhost:8080/v1/chat/completions",
+                          data=json.dumps(body).encode(),
+                          headers={"Content-Type": "application/json"}
+                      )
+                      with urllib.request.urlopen(req) as res:
+                          self.send_response(res.getcode())
+                          self.send_header("Content-Type", "application/json")
+                          self.end_headers()
+                          self.wfile.write(res.read())
+                  except Exception as e:
+                      self.send_response(500)
                       self.end_headers()
-                      self.wfile.write(res.read())
+                      self.wfile.write(str(e).encode())
 
           http.server.HTTPServer(('0.0.0.0', 11434), ProxyHandler).serve_forever()
           PYEOF
@@ -115,9 +119,13 @@ jobs:
           wget -q https://github.com
           sudo dpkg -i cloudflared-linux-amd64.deb
           cloudflared tunnel --url http://localhost:11434 &
-          sleep 5
+          sleep 10
+          echo "---------------------------------------------------"
           echo "TUNNEL ENDPOINT:"
-          curl -s http://localhost:45678/metrics | grep -o 'https://[-a-z0-9.]*.trycloudflare.com' || true
+          curl -s http://localhost:45678/metrics | grep -o 'https://[-a-z0-9.]*.trycloudflare.com' || echo "Tunnel not found yet..."
+          echo "---------------------------------------------------"
 
       - name: Keep Alive
-        run: sleep $(( ${{ env.SESSION_HOURS }} * 3600 ))
+        run: |
+          echo "Session active for ${{ env.SESSION_HOURS }} hours."
+          sleep $(( ${{ env.SESSION_HOURS }} * 3600 ))
