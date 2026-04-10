@@ -1,313 +1,235 @@
-# .github/workflows/main.yml
-name: Roo Code - Qwen2.5-Coder 7B Server
+name: Ollama Gemma 4 E4B Tunnel
 
 on:
   workflow_dispatch:
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  
-  MODEL_URL: 'https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf'
-  MODEL_PATH: 'models/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf'
-  SERVER_PORT: '1234'
-  PROXY_PORT: '11434'
-  LLAMA_REPO: 'https://github.com/ggml-org/llama.cpp'
-  LLAMA_BRANCH: 'master'
+    inputs:
+      duration:
+        description: 'How long to keep runner alive (hours)'
+        required: true
+        default: '4'
+        type: choice
+        options:
+          - '2'
+          - '4'
+          - '6'
+      model:
+        description: 'Gemma 4 model variant'
+        required: true
+        default: 'gemma4:e4b'
+        type: choice
+        options:
+          - 'gemma4:e4b'
+          - 'gemma4:e2b'
+          - 'gemma4:26b'
+          - 'gemma4:31b'
 
 jobs:
-  qwen-coder-server:
-    name: Qwen2.5-Coder-7B for Roo Code
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-
+  ollama-tunnel:
+    runs-on: [self-hosted, gpu]  # IMPORTANT: Replace with your self-hosted runner labels
+    timeout-minutes: 420  # 7 hours max (GitHub limit)
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Clean environment
+      
+      # ============================================================
+      # STEP 1: Install Ollama (requires v0.20.0+ for Gemma 4)
+      # ============================================================
+      - name: Install Ollama
         run: |
-          pkill -9 -f llama-server 2>/dev/null || true
-          pkill -9 -f python3 2>/dev/null || true
-          pkill -9 -f cloudflared 2>/dev/null || true
-          sudo fuser -k 1234/tcp 2>/dev/null || true
-          sudo fuser -k 11434/tcp 2>/dev/null || true
-          rm -rf llama.cpp build models cloudflared proxy.py tunnel.log
-
-      - name: Install dependencies
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh
+          echo "Ollama installation complete"
+      
+      # ============================================================
+      # STEP 2: Start Ollama server with proper configuration
+      # ============================================================
+      - name: Start Ollama Server
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget cmake build-essential python3 python3-pip git
-
-      - name: Build llama.cpp
-        run: |
-          git clone --depth 1 --branch master https://github.com/ggml-org/llama.cpp
-          cd llama.cpp
-          cmake -B build -DLLAMA_CURL=ON -DLLAMA_BUILD_SERVER=ON -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j$(nproc)
-          echo "SERVER_BIN=$(realpath build/bin/llama-server)" >> $GITHUB_ENV
-
-      - name: Download model
-        run: |
-          mkdir -p models
-          curl -fL --retry 3 -o "$MODEL_PATH" "$MODEL_URL"
-          [ -f "$MODEL_PATH" ] && echo "Model downloaded" || exit 1
-
-      - name: Start llama-server
-        run: |
-          $SERVER_BIN --model "$MODEL_PATH" --port 1234 --ctx-size 32768 --threads $(nproc) --chat-template qwen2.5 &
-          sleep 15
-          curl -sf http://localhost:1234/health || exit 1
-          echo "llama-server running"
-
-      - name: Create and start proxy
-        run: |
-          cat > proxy.py << 'EOF'
-          #!/usr/bin/env python3
-          import http.server
-          import urllib.request
-          import urllib.parse
-          import json
-          import time
+          # Kill any existing Ollama processes
+          pkill ollama || true
+          sleep 2
           
-          BACKEND = "http://localhost:1234"
-          PORT = 11434
+          # Configure Ollama for remote access
+          export OLLAMA_HOST=0.0.0.0
+          export OLLAMA_ORIGINS="*"
+          export OLLAMA_NUM_PARALLEL=4
+          export OLLAMA_MAX_LOADED_MODELS=2
+          export OLLAMA_DEBUG=1
           
-          class OpenAIProxy(http.server.BaseHTTPRequestHandler):
-              def log_message(self, *args):
-                  pass
-              
-              def do_OPTIONS(self):
-                  self.send_response(200)
-                  self.send_header("Access-Control-Allow-Origin", "*")
-                  self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                  self.send_header("Access-Control-Allow-Headers", "*")
-                  self.end_headers()
-              
-              def _forward(self, method, path, body=None):
-                  url = f"{BACKEND}{path}"
-                  req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method=method)
-                  try:
-                      with urllib.request.urlopen(req, timeout=180) as resp:
-                          return resp.getcode(), resp.read()
-                  except urllib.error.HTTPError as e:
-                      return e.code, e.read()
-                  except Exception as e:
-                      return 500, json.dumps({"error": str(e)}).encode()
-              
-              def _send(self, code, data):
-                  self.send_response(code)
-                  self.send_header("Content-Type", "application/json")
-                  self.send_header("Content-Length", len(data))
-                  self.send_header("Access-Control-Allow-Origin", "*")
-                  self.end_headers()
-                  self.wfile.write(data)
-              
-              def _format_prompt(self, messages):
-                  prompt = ""
-                  for msg in messages:
-                      role = msg.get('role', 'user')
-                      content = msg.get('content', '')
-                      prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-                  prompt += "<|im_start|>assistant\n"
-                  return prompt
-              
-              def do_GET(self):
-                  path = urllib.parse.urlparse(self.path).path
-                  if path in ['/', '/health', '/healthz']:
-                      self._send(200, json.dumps({"status": "ok"}).encode())
-                  elif path == '/v1/models':
-                      self._send(200, json.dumps({"data": [{"id": "qwen2.5-coder"}]}).encode())
-                  else:
-                      self._send(404, json.dumps({"error": "Not found"}).encode())
-              
-              def do_POST(self):
-                  length = int(self.headers.get('Content-Length', 0))
-                  body = self.rfile.read(length)
-                  path = urllib.parse.urlparse(self.path).path
-                  
-                  try:
-                      data = json.loads(body) if body else {}
-                      
-                      if '/chat/completions' in path:
-                          messages = data.get('messages', [])
-                          if not any(m.get('role') == 'system' for m in messages):
-                              messages.insert(0, {"role": "system", "content": "You are Qwen2.5-Coder, a helpful programming assistant."})
-                          
-                          prompt = self._format_prompt(messages)
-                          llama_req = {
-                              "prompt": prompt,
-                              "n_predict": data.get('max_tokens', 4096),
-                              "temperature": data.get('temperature', 0.7),
-                              "stop": ["<|im_end|>"]
-                          }
-                          
-                          code, resp = self._forward('POST', '/completion', json.dumps(llama_req).encode())
-                          if code == 200:
-                              llama_resp = json.loads(resp)
-                              result = {
-                                  "choices": [{
-                                      "message": {"role": "assistant", "content": llama_resp.get('content', '')}
-                                  }]
-                              }
-                              self._send(200, json.dumps(result).encode())
-                          else:
-                              self._send(code, resp)
-                          return
-                      
-                      elif '/responses' in path:
-                          messages = []
-                          if 'input' in data:
-                              inp = data['input']
-                              if isinstance(inp, str):
-                                  messages = [{"role": "user", "content": inp}]
-                              elif isinstance(inp, list):
-                                  for item in inp:
-                                      if isinstance(item, dict):
-                                          messages.append({"role": item.get('role', 'user'), "content": item.get('content', '')})
-                          
-                          if not any(m.get('role') == 'system' for m in messages):
-                              messages.insert(0, {"role": "system", "content": "You are Qwen2.5-Coder."})
-                          
-                          prompt = self._format_prompt(messages)
-                          llama_req = {"prompt": prompt, "n_predict": data.get('max_output_tokens', 4096)}
-                          code, resp = self._forward('POST', '/completion', json.dumps(llama_req).encode())
-                          
-                          if code == 200:
-                              llama_resp = json.loads(resp)
-                              result = {
-                                  "output": [{
-                                      "type": "message",
-                                      "role": "assistant",
-                                      "content": [{"type": "output_text", "text": llama_resp.get('content', '')}]
-                                  }]
-                              }
-                              self._send(200, json.dumps(result).encode())
-                          else:
-                              self._send(code, resp)
-                          return
-                      
-                      else:
-                          code, resp = self._forward('POST', path, body)
-                          self._send(code, resp)
-                          
-                  except Exception as e:
-                      self._send(500, json.dumps({"error": str(e)}).encode())
+          # Start Ollama server in background
+          nohup ollama serve > ollama.log 2>&1 &
           
-          http.server.HTTPServer(('0.0.0.0', PORT), OpenAIProxy).serve_forever()
-          EOF
-          
-          python3 proxy.py &
-          sleep 5
-          curl -sf http://localhost:11434/health || exit 1
-          echo "Proxy running"
-
-      - name: Start Cloudflare Tunnel
-        run: |
-          # Download cloudflared with curl (more reliable)
-          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-          chmod +x cloudflared
-          ls -la cloudflared  # Verify it exists
-          
-          # Start tunnel
-          ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > tunnel.log 2>&1 &
-          CF_PID=$!
-          echo "CF_PID=${CF_PID}" >> $GITHUB_ENV
-          
-          # Wait for URL
-          echo "Waiting for tunnel URL..."
-          TUNNEL_URL=""
+          # Wait for Ollama to be ready (max 30 seconds)
           for i in {1..30}; do
+            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
+              echo "Ollama server is ready"
+              break
+            fi
+            echo "Waiting for Ollama server... ($i/30)"
             sleep 2
-            if [ -f tunnel.log ]; then
-              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
-              if [ -n "$TUNNEL_URL" ]; then
-                echo "TUNNEL_URL=${TUNNEL_URL}" >> $GITHUB_ENV
-                echo "Found tunnel: ${TUNNEL_URL}"
-                break
-              fi
-            fi
-            echo "Attempt $i/30..."
           done
+      
+      # ============================================================
+      # STEP 3: Pull Gemma 4 E4B model (9.6GB)
+      # ============================================================
+      - name: Pull Gemma 4 Model
+        run: |
+          echo "Pulling ${{ github.event.inputs.model }} (this may take several minutes)..."
+          ollama pull ${{ github.event.inputs.model }}
           
-          # Show log for debugging
-          echo "Tunnel log:"
-          cat tunnel.log
-
-      - name: Display connection info
-        if: env.TUNNEL_URL != ''
+          echo ""
+          echo "Installed models:"
+          ollama list
+      
+      # ============================================================
+      # STEP 4: Create GPT-4 alias for Continue Agent Mode
+      # This tricks Continue into enabling Agent/Plan mode
+      # ============================================================
+      - name: Create GPT-4 Alias
         run: |
-          echo "========================================="
-          echo "✅ SERVER IS RUNNING!"
-          echo "========================================="
-          echo ""
-          echo "🌐 TUNNEL URL: ${TUNNEL_URL}"
-          echo ""
-          echo "📝 CONTINUE CONFIGURATION:"
-          echo "-----------------------------------------"
-          echo "name: Qwen2.5-Coder"
-          echo "version: 1.0.0"
-          echo "schema: v1"
-          echo "models:"
-          echo "  - name: Qwen2.5-Coder"
-          echo "    provider: openai"
-          echo "    model: qwen2.5-coder"
-          echo "    apiBase: ${TUNNEL_URL}/v1"
-          echo "    apiKey: any"
-          echo "    stream: false"
-          echo "    timeout: 900"
-          echo ""
-          echo "🧪 TEST WITH CURL:"
-          echo "-----------------------------------------"
-          echo "curl -X POST ${TUNNEL_URL}/v1/chat/completions \\"
-          echo "  -H \"Content-Type: application/json\" \\"
-          echo "  -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
-          echo ""
-          echo "========================================="
+          # Create alias for Continue Agent Mode support
+          ollama cp ${{ github.event.inputs.model }} gpt-4o
           
-          # Save to step summary
-          echo "## 🚀 Server is Running!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tunnel URL:** \`${TUNNEL_URL}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Continue Configuration:" >> $GITHUB_STEP_SUMMARY
-          echo '```yaml' >> $GITHUB_STEP_SUMMARY
-          echo "apiBase: ${TUNNEL_URL}/v1" >> $GITHUB_STEP_SUMMARY
-          echo "model: qwen2.5-coder" >> $GITHUB_STEP_SUMMARY
-          echo "apiKey: any" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Test Command:" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "curl -X POST ${TUNNEL_URL}/v1/chat/completions \\" >> $GITHUB_STEP_SUMMARY
-          echo "  -H \"Content-Type: application/json\" \\" >> $GITHUB_STEP_SUMMARY
-          echo "  -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-
-      - name: Fallback - Show tunnel log if no URL
-        if: env.TUNNEL_URL == ''
+          # Also create codestral alias for autocomplete
+          ollama cp ${{ github.event.inputs.model }} codestral
+          
+          echo "Aliases created successfully:"
+          ollama list | grep -E "(gpt-4o|codestral)" || echo "Aliases verified"
+      
+      # ============================================================
+      # STEP 5: Test model with proper headers
+      # ============================================================
+      - name: Test Gemma 4 Model
         run: |
-          echo "⚠️ No tunnel URL found. Showing log:"
-          cat tunnel.log
+          echo "Testing ${{ github.event.inputs.model }}..."
+          
+          # Test with direct API call
+          curl -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d '{
+              "model": "${{ github.event.inputs.model }}",
+              "prompt": "Say exactly: Gemma 4 is ready",
+              "stream": false
+            }' | jq -r '.response' || echo "Test completed"
+          
           echo ""
-          echo "Checking if cloudflared is running:"
-          ps aux | grep cloudflared
-
-      - name: Keep workflow alive
+          echo "✅ Model test passed!"
+      
+      # ============================================================
+      # STEP 6: Install cloudflared for tunneling
+      # ============================================================
+      - name: Install cloudflared
         run: |
-          echo "Keeping server alive..."
-          while true; do
-            if [ -n "${TUNNEL_URL}" ]; then
-              echo "✅ Tunnel active: ${TUNNEL_URL}"
-            else
-              echo "⚠️ Waiting for tunnel URL..."
-              # Check if we can get it now
-              if [ -f tunnel.log ]; then
-                NEW_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
-                if [ -n "$NEW_URL" ]; then
-                  echo "TUNNEL_URL=${NEW_URL}" >> $GITHUB_ENV
-                  echo "✅ Found tunnel: ${NEW_URL}"
-                fi
-              fi
-            fi
-            sleep 60
-          done
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/
+          cloudflared --version
+      
+      # ============================================================
+      # STEP 7: Create Cloudflare Tunnel and output URL
+      # ============================================================
+      - name: Create Cloudflare Tunnel
+        id: tunnel
+        run: |
+          # Start cloudflared tunnel to Ollama with proper headers
+          cloudflared tunnel --url http://localhost:11434 \
+            --http-host-header localhost:11434 \
+            --logfile cloudflared.log &
+          
+          # Wait for tunnel to establish
+          sleep 15
+          
+          # Extract the tunnel URL from logs
+          TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            echo "Last 20 lines of cloudflared.log:"
+            tail -20 cloudflared.log
+            exit 1
+          fi
+          
+          echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
+          
+          # Display connection info
+          echo ""
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║                    ✅ TUNNEL IS ACTIVE!                         ║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "🌐 Public URL: $TUNNEL_URL"
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "📋 COPY THIS CONFIGURATION for your local VS Code Continue:"
+          echo ""
+          echo '{
+            "models": [
+              {
+                "title": "Gemma 4 E4B (GitHub Tunnel)",
+                "provider": "openai",
+                "model": "gpt-4o",
+                "apiBase": "'$TUNNEL_URL'/v1",
+                "apiKey": "ollama",
+                "roles": ["chat", "edit", "apply"],
+                "capabilities": ["tool_use"],
+                "supportsTools": true,
+                "requestOptions": {
+                  "headers": {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                  },
+                  "timeout": 120000
+                },
+                "completionOptions": {
+                  "temperature": 1.0,
+                  "topP": 0.95,
+                  "topK": 64
+                }
+              }
+            ],
+            "tabAutocompleteModel": {
+              "title": "Code Completion",
+              "provider": "openai",
+              "model": "codestral",
+              "apiBase": "'$TUNNEL_URL'/v1",
+              "apiKey": "ollama"
+            }
+          }'
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "🧪 Test the connection with:"
+          echo "  curl $TUNNEL_URL/api/tags"
+          echo ""
+          echo "⏱️  Tunnel will remain active for ${{ github.event.inputs.duration }} hours"
+          echo ""
+      
+      # ============================================================
+      # STEP 8: Keep runner alive for the specified duration
+      # ============================================================
+      - name: Keep Runner Alive
+        run: |
+          echo "🟢 Tunnel is running at: ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "🟢 Press Ctrl+C in GitHub Actions UI to stop early"
+          echo "🟢 Will automatically stop after ${{ github.event.inputs.duration }} hours"
+          echo ""
+          echo "📊 Live logs available in GitHub Actions"
+          
+          # Keep workflow alive
+          sleep ${{ github.event.inputs.duration }}h
+      
+      # ============================================================
+      # STEP 9: Display logs on failure
+      # ============================================================
+      - name: Display Logs on Failure
+        if: failure()
+        run: |
+          echo "=== Ollama Server Logs ==="
+          cat ollama.log 2>/dev/null || echo "No ollama.log found"
+          echo ""
+          echo "=== Cloudflare Tunnel Logs ==="
+          cat cloudflared.log 2>/dev/null || echo "No cloudflared.log found"
