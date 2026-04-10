@@ -55,10 +55,11 @@ jobs:
       - name: Start llama-server
         run: |
           $SERVER_BIN --model "$MODEL_PATH" --port 1234 --ctx-size 32768 --threads $(nproc) --chat-template qwen2.5 &
-          sleep 10
+          sleep 15
           curl -sf http://localhost:1234/health || exit 1
+          echo "llama-server running"
 
-      - name: Create and start full OpenAI-compatible proxy
+      - name: Create and start proxy
         run: |
           cat > proxy.py << 'EOF'
           #!/usr/bin/env python3
@@ -66,7 +67,6 @@ jobs:
           import urllib.request
           import urllib.parse
           import json
-          import os
           import time
           
           BACKEND = "http://localhost:1234"
@@ -79,148 +79,83 @@ jobs:
               def do_OPTIONS(self):
                   self.send_response(200)
                   self.send_header("Access-Control-Allow-Origin", "*")
-                  self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-                  self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
+                  self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                  self.send_header("Access-Control-Allow-Headers", "*")
                   self.end_headers()
               
-              def _forward(self, method, path, body=None, headers={}):
+              def _forward(self, method, path, body=None):
                   url = f"{BACKEND}{path}"
-                  req_headers = {"Content-Type": "application/json"}
-                  req_headers.update(headers)
-                  
-                  req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+                  req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method=method)
                   try:
                       with urllib.request.urlopen(req, timeout=180) as resp:
-                          return resp.getcode(), resp.read(), dict(resp.headers)
+                          return resp.getcode(), resp.read()
                   except urllib.error.HTTPError as e:
-                      return e.code, e.read(), dict(e.headers)
+                      return e.code, e.read()
                   except Exception as e:
-                      return 500, json.dumps({"error": str(e)}).encode(), {}
+                      return 500, json.dumps({"error": str(e)}).encode()
               
-              def _send(self, code, data, content_type="application/json"):
+              def _send(self, code, data):
                   self.send_response(code)
-                  self.send_header("Content-Type", content_type)
+                  self.send_header("Content-Type", "application/json")
                   self.send_header("Content-Length", len(data))
                   self.send_header("Access-Control-Allow-Origin", "*")
                   self.end_headers()
                   self.wfile.write(data)
               
               def _format_prompt(self, messages):
-                  """Format messages using Qwen2.5 chat template"""
                   prompt = ""
                   for msg in messages:
                       role = msg.get('role', 'user')
                       content = msg.get('content', '')
-                      if role == 'system':
-                          prompt += f"<|im_start|>system\n{content}<|im_end|>\n"
-                      elif role == 'user':
-                          prompt += f"<|im_start|>user\n{content}<|im_end|>\n"
-                      elif role == 'assistant':
-                          prompt += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+                      prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
                   prompt += "<|im_start|>assistant\n"
                   return prompt
               
-              def _generate(self, messages, stream=False, max_tokens=4096, temperature=0.7):
-                  """Send to llama.cpp and get response"""
-                  prompt = self._format_prompt(messages)
-                  
-                  llama_req = {
-                      "prompt": prompt,
-                      "n_predict": max_tokens,
-                      "temperature": temperature,
-                      "top_p": 0.95,
-                      "stop": ["<|im_end|>", "<|endoftext|>"]
-                  }
-                  
-                  code, resp, _ = self._forward('POST', '/completion', json.dumps(llama_req).encode())
-                  
-                  if code == 200:
-                      llama_resp = json.loads(resp)
-                      return llama_resp.get('content', '')
-                  return ""
-              
               def do_GET(self):
                   path = urllib.parse.urlparse(self.path).path
-                  
-                  # Health check
                   if path in ['/', '/health', '/healthz']:
-                      self._send(200, json.dumps({"status": "ok", "model": "qwen2.5-coder"}).encode())
-                  
-                  # Models endpoint
+                      self._send(200, json.dumps({"status": "ok"}).encode())
                   elif path == '/v1/models':
-                      models = {
-                          "object": "list",
-                          "data": [{
-                              "id": "qwen2.5-coder-7b",
-                              "object": "model",
-                              "created": int(time.time()),
-                              "owned_by": "qwen"
-                          }]
-                      }
-                      self._send(200, json.dumps(models).encode())
-                  
-                  # OpenAI v1 models
-                  elif path == '/models':
-                      models = {
-                          "data": [{"id": "qwen2.5-coder-7b", "type": "model"}]
-                      }
-                      self._send(200, json.dumps(models).encode())
-                  
+                      self._send(200, json.dumps({"data": [{"id": "qwen2.5-coder"}]}).encode())
                   else:
                       self._send(404, json.dumps({"error": "Not found"}).encode())
               
               def do_POST(self):
-                  content_length = int(self.headers.get('Content-Length', 0))
-                  body = self.rfile.read(content_length)
+                  length = int(self.headers.get('Content-Length', 0))
+                  body = self.rfile.read(length)
                   path = urllib.parse.urlparse(self.path).path
                   
                   try:
                       data = json.loads(body) if body else {}
                       
-                      # === CHAT COMPLETIONS ENDPOINT ===
-                      if path == '/v1/chat/completions' or path == '/chat/completions':
+                      if '/chat/completions' in path:
                           messages = data.get('messages', [])
-                          
-                          # Add system message if missing
                           if not any(m.get('role') == 'system' for m in messages):
-                              messages.insert(0, {"role": "system", "content": "You are Qwen2.5-Coder, an expert programming assistant. Provide helpful, accurate responses."})
+                              messages.insert(0, {"role": "system", "content": "You are Qwen2.5-Coder, a helpful programming assistant."})
                           
-                          # Generate response
-                          response_text = self._generate(
-                              messages,
-                              data.get('stream', False),
-                              data.get('max_tokens', 4096),
-                              data.get('temperature', 0.7)
-                          )
-                          
-                          # Format response
-                          result = {
-                              "id": f"chatcmpl-{int(time.time())}",
-                              "object": "chat.completion",
-                              "created": int(time.time()),
-                              "model": "qwen2.5-coder-7b",
-                              "choices": [{
-                                  "index": 0,
-                                  "message": {
-                                      "role": "assistant",
-                                      "content": response_text
-                                  },
-                                  "finish_reason": "stop"
-                              }],
-                              "usage": {
-                                  "prompt_tokens": len(str(messages)),
-                                  "completion_tokens": len(response_text),
-                                  "total_tokens": len(str(messages)) + len(response_text)
-                              }
+                          prompt = self._format_prompt(messages)
+                          llama_req = {
+                              "prompt": prompt,
+                              "n_predict": data.get('max_tokens', 4096),
+                              "temperature": data.get('temperature', 0.7),
+                              "stop": ["<|im_end|>"]
                           }
                           
-                          self._send(200, json.dumps(result).encode())
+                          code, resp = self._forward('POST', '/completion', json.dumps(llama_req).encode())
+                          if code == 200:
+                              llama_resp = json.loads(resp)
+                              result = {
+                                  "choices": [{
+                                      "message": {"role": "assistant", "content": llama_resp.get('content', '')}
+                                  }]
+                              }
+                              self._send(200, json.dumps(result).encode())
+                          else:
+                              self._send(code, resp)
+                          return
                       
-                      # === RESPONSES API ENDPOINT (for Continue) ===
                       elif '/responses' in path:
                           messages = []
-                          
-                          # Parse input
                           if 'input' in data:
                               inp = data['input']
                               if isinstance(inp, str):
@@ -228,152 +163,133 @@ jobs:
                               elif isinstance(inp, list):
                                   for item in inp:
                                       if isinstance(item, dict):
-                                          role = item.get('role', 'user')
-                                          content = item.get('content', '')
-                                          if isinstance(content, list):
-                                              for c in content:
-                                                  if isinstance(c, dict) and c.get('type') == 'input_text':
-                                                      messages.append({"role": role, "content": c.get('text', '')})
-                                          else:
-                                              messages.append({"role": role, "content": content})
+                                          messages.append({"role": item.get('role', 'user'), "content": item.get('content', '')})
                           
-                          # Add system message
                           if not any(m.get('role') == 'system' for m in messages):
-                              messages.insert(0, {"role": "system", "content": "You are Qwen2.5-Coder, a coding assistant."})
+                              messages.insert(0, {"role": "system", "content": "You are Qwen2.5-Coder."})
                           
-                          # Generate response
-                          response_text = self._generate(
-                              messages,
-                              False,
-                              data.get('max_output_tokens', 4096),
-                              data.get('temperature', 0.7)
-                          )
+                          prompt = self._format_prompt(messages)
+                          llama_req = {"prompt": prompt, "n_predict": data.get('max_output_tokens', 4096)}
+                          code, resp = self._forward('POST', '/completion', json.dumps(llama_req).encode())
                           
-                          # Format as Responses API
-                          result = {
-                              "id": f"resp_{int(time.time())}",
-                              "object": "response",
-                              "status": "completed",
-                              "output": [{
-                                  "type": "message",
-                                  "role": "assistant",
-                                  "content": [{
-                                      "type": "output_text",
-                                      "text": response_text
+                          if code == 200:
+                              llama_resp = json.loads(resp)
+                              result = {
+                                  "output": [{
+                                      "type": "message",
+                                      "role": "assistant",
+                                      "content": [{"type": "output_text", "text": llama_resp.get('content', '')}]
                                   }]
-                              }],
-                              "usage": {
-                                  "output_tokens": len(response_text),
-                                  "input_tokens": len(str(messages))
                               }
-                          }
-                          
-                          self._send(200, json.dumps(result).encode())
+                              self._send(200, json.dumps(result).encode())
+                          else:
+                              self._send(code, resp)
+                          return
                       
-                      # === COMPLETIONS ENDPOINT (legacy) ===
-                      elif path == '/v1/completions' or path == '/completions':
-                          prompt = data.get('prompt', '')
-                          messages = [{"role": "user", "content": prompt}]
-                          
-                          response_text = self._generate(
-                              messages,
-                              False,
-                              data.get('max_tokens', 4096),
-                              data.get('temperature', 0.7)
-                          )
-                          
-                          result = {
-                              "id": f"cmpl-{int(time.time())}",
-                              "object": "text_completion",
-                              "created": int(time.time()),
-                              "model": "qwen2.5-coder-7b",
-                              "choices": [{
-                                  "text": response_text,
-                                  "index": 0,
-                                  "finish_reason": "stop"
-                              }]
-                          }
-                          
-                          self._send(200, json.dumps(result).encode())
-                      
-                      # === EMBEDDINGS ENDPOINT ===
-                      elif path == '/v1/embeddings' or path == '/embeddings':
-                          # Simple placeholder embeddings
-                          result = {
-                              "object": "list",
-                              "data": [{
-                                  "object": "embedding",
-                                  "index": 0,
-                                  "embedding": [0.0] * 768
-                              }],
-                              "model": "qwen2.5-coder-7b",
-                              "usage": {
-                                  "prompt_tokens": 0,
-                                  "total_tokens": 0
-                              }
-                          }
-                          self._send(200, json.dumps(result).encode())
-                      
-                      # === Forward other requests to backend ===
                       else:
-                          code, resp, headers = self._forward('POST', path, body)
+                          code, resp = self._forward('POST', path, body)
                           self._send(code, resp)
-                      
+                          
                   except Exception as e:
-                      print(f"Error: {e}")
                       self._send(500, json.dumps({"error": str(e)}).encode())
-          
-          print(f"OpenAI-compatible proxy running on port {PORT}")
-          print("Supported endpoints:")
-          print("  - GET  /health")
-          print("  - GET  /v1/models")
-          print("  - POST /v1/chat/completions")
-          print("  - POST /v1/responses")
-          print("  - POST /v1/completions")
-          print("  - POST /v1/embeddings")
           
           http.server.HTTPServer(('0.0.0.0', PORT), OpenAIProxy).serve_forever()
           EOF
           
           python3 proxy.py &
           sleep 5
-          echo "Proxy started successfully"
+          curl -sf http://localhost:11434/health || exit 1
+          echo "Proxy running"
 
-      - name: Start tunnel
+      - name: Start Cloudflare Tunnel
         run: |
-          curl -fL -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          # Download cloudflared
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > tunnel.log 2>&1 &
           
-          echo "Waiting for tunnel..."
+          # Start tunnel in background
+          nohup ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > tunnel.log 2>&1 &
+          CF_PID=$!
+          echo "CF_PID=${CF_PID}" >> $GITHUB_ENV
+          
+          # Wait for tunnel to establish
+          echo "Waiting for tunnel URL..."
           for i in {1..30}; do
+            sleep 2
             if [ -f tunnel.log ]; then
-              PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n1)
-              if [ -n "$PUBLIC_URL" ]; then
+              URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
+              if [ -n "$URL" ]; then
+                echo "TUNNEL_URL=${URL}" >> $GITHUB_ENV
+                echo "TUNNEL_URL=${URL}" >> $GITHUB_OUTPUT
+                echo "✅ Tunnel URL: ${URL}"
                 break
               fi
             fi
-            sleep 2
+            echo "Attempt $i/30 - Waiting for tunnel..."
           done
           
-          echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_ENV
-          echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_STEP_SUMMARY
+          # Show tunnel log for debugging
+          echo "Tunnel log contents:"
+          cat tunnel.log || echo "No log file"
+
+      - name: Display connection info
+        if: env.TUNNEL_URL != ''
+        run: |
+          echo "========================================="
+          echo "✅ SERVER IS RUNNING!"
+          echo "========================================="
+          echo ""
+          echo "🌐 TUNNEL URL: ${TUNNEL_URL}"
+          echo ""
+          echo "📝 CONTINUE CONFIGURATION:"
+          echo "-----------------------------------------"
+          cat << 'CONFIG'
+          name: Qwen2.5-Coder
+          version: 1.0.0
+          schema: v1
+          models:
+            - name: Qwen2.5-Coder
+              provider: openai
+              model: qwen2.5-coder
+              apiBase: ENDPOINT_HERE/v1
+              apiKey: "any"
+              stream: false
+              timeout: 900
+          CONFIG
+          echo ""
+          echo "👉 Replace ENDPOINT_HERE with: ${TUNNEL_URL}"
+          echo ""
+          echo "🧪 TEST WITH CURL:"
+          echo "-----------------------------------------"
+          cat << 'CURLTEST'
+          curl -X POST ENDPOINT_HERE/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"messages":[{"role":"user","content":"Say hello"}]}'
+          CURLTEST
+          echo ""
+          echo "👉 Replace ENDPOINT_HERE with: ${TUNNEL_URL}"
+          echo "========================================="
+          
+          # Save to step summary
+          echo "## 🚀 Server is Running!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ Tunnel URL: ${PUBLIC_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tunnel URL:** \`${TUNNEL_URL}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Continue Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "### Continue Configuration:" >> $GITHUB_STEP_SUMMARY
           echo '```yaml' >> $GITHUB_STEP_SUMMARY
-          echo "apiBase: ${PUBLIC_URL}/v1" >> $GITHUB_STEP_SUMMARY
-          echo "model: qwen2.5-coder-7b" >> $GITHUB_STEP_SUMMARY
+          echo "apiBase: ${TUNNEL_URL}/v1" >> $GITHUB_STEP_SUMMARY
+          echo "model: qwen2.5-coder" >> $GITHUB_STEP_SUMMARY
           echo "apiKey: any" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## Test with curl:" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "curl ${PUBLIC_URL}/v1/chat/completions \\" >> $GITHUB_STEP_SUMMARY
-          echo '  -H "Content-Type: application/json" \\' >> $GITHUB_STEP_SUMMARY
-          echo '  -d '"'"'{"messages":[{"role":"user","content":"Say hello"}]}'"'"'' >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
 
-      - name: Keep alive
-        run: while true; do sleep 300; done
+      - name: Keep workflow alive
+        run: |
+          echo "Keeping server alive..."
+          while true; do
+            if [ -n "${TUNNEL_URL}" ]; then
+              echo "✅ Tunnel active: ${TUNNEL_URL}"
+            else
+              echo "⚠️ Waiting for tunnel URL..."
+            fi
+            sleep 60
+          done
