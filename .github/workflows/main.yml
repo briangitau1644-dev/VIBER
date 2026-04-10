@@ -203,34 +203,35 @@ jobs:
 
       - name: Start Cloudflare Tunnel
         run: |
-          # Download cloudflared
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          # Download cloudflared with curl (more reliable)
+          curl -L -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
+          ls -la cloudflared  # Verify it exists
           
-          # Start tunnel in background
-          nohup ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > tunnel.log 2>&1 &
+          # Start tunnel
+          ./cloudflared tunnel --url http://localhost:11434 --no-autoupdate > tunnel.log 2>&1 &
           CF_PID=$!
           echo "CF_PID=${CF_PID}" >> $GITHUB_ENV
           
-          # Wait for tunnel to establish
+          # Wait for URL
           echo "Waiting for tunnel URL..."
+          TUNNEL_URL=""
           for i in {1..30}; do
             sleep 2
             if [ -f tunnel.log ]; then
-              URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
-              if [ -n "$URL" ]; then
-                echo "TUNNEL_URL=${URL}" >> $GITHUB_ENV
-                echo "TUNNEL_URL=${URL}" >> $GITHUB_OUTPUT
-                echo "✅ Tunnel URL: ${URL}"
+              TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
+              if [ -n "$TUNNEL_URL" ]; then
+                echo "TUNNEL_URL=${TUNNEL_URL}" >> $GITHUB_ENV
+                echo "Found tunnel: ${TUNNEL_URL}"
                 break
               fi
             fi
-            echo "Attempt $i/30 - Waiting for tunnel..."
+            echo "Attempt $i/30..."
           done
           
-          # Show tunnel log for debugging
-          echo "Tunnel log contents:"
-          cat tunnel.log || echo "No log file"
+          # Show log for debugging
+          echo "Tunnel log:"
+          cat tunnel.log
 
       - name: Display connection info
         if: env.TUNNEL_URL != ''
@@ -243,31 +244,24 @@ jobs:
           echo ""
           echo "📝 CONTINUE CONFIGURATION:"
           echo "-----------------------------------------"
-          cat << 'CONFIG'
-          name: Qwen2.5-Coder
-          version: 1.0.0
-          schema: v1
-          models:
-            - name: Qwen2.5-Coder
-              provider: openai
-              model: qwen2.5-coder
-              apiBase: ENDPOINT_HERE/v1
-              apiKey: "any"
-              stream: false
-              timeout: 900
-          CONFIG
-          echo ""
-          echo "👉 Replace ENDPOINT_HERE with: ${TUNNEL_URL}"
+          echo "name: Qwen2.5-Coder"
+          echo "version: 1.0.0"
+          echo "schema: v1"
+          echo "models:"
+          echo "  - name: Qwen2.5-Coder"
+          echo "    provider: openai"
+          echo "    model: qwen2.5-coder"
+          echo "    apiBase: ${TUNNEL_URL}/v1"
+          echo "    apiKey: any"
+          echo "    stream: false"
+          echo "    timeout: 900"
           echo ""
           echo "🧪 TEST WITH CURL:"
           echo "-----------------------------------------"
-          cat << 'CURLTEST'
-          curl -X POST ENDPOINT_HERE/v1/chat/completions \
-            -H "Content-Type: application/json" \
-            -d '{"messages":[{"role":"user","content":"Say hello"}]}'
-          CURLTEST
+          echo "curl -X POST ${TUNNEL_URL}/v1/chat/completions \\"
+          echo "  -H \"Content-Type: application/json\" \\"
+          echo "  -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}'"
           echo ""
-          echo "👉 Replace ENDPOINT_HERE with: ${TUNNEL_URL}"
           echo "========================================="
           
           # Save to step summary
@@ -281,6 +275,22 @@ jobs:
           echo "model: qwen2.5-coder" >> $GITHUB_STEP_SUMMARY
           echo "apiKey: any" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Test Command:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "curl -X POST ${TUNNEL_URL}/v1/chat/completions \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -H \"Content-Type: application/json\" \\" >> $GITHUB_STEP_SUMMARY
+          echo "  -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Fallback - Show tunnel log if no URL
+        if: env.TUNNEL_URL == ''
+        run: |
+          echo "⚠️ No tunnel URL found. Showing log:"
+          cat tunnel.log
+          echo ""
+          echo "Checking if cloudflared is running:"
+          ps aux | grep cloudflared
 
       - name: Keep workflow alive
         run: |
@@ -290,6 +300,14 @@ jobs:
               echo "✅ Tunnel active: ${TUNNEL_URL}"
             else
               echo "⚠️ Waiting for tunnel URL..."
+              # Check if we can get it now
+              if [ -f tunnel.log ]; then
+                NEW_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1)
+                if [ -n "$NEW_URL" ]; then
+                  echo "TUNNEL_URL=${NEW_URL}" >> $GITHUB_ENV
+                  echo "✅ Found tunnel: ${NEW_URL}"
+                fi
+              fi
             fi
             sleep 60
           done
