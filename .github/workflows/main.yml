@@ -22,6 +22,7 @@ jobs:
       - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
+          echo "✅ Ollama installed successfully"
       
       - name: Start Ollama Server
         run: |
@@ -29,84 +30,220 @@ jobs:
           export OLLAMA_ORIGINS="*"
           export OLLAMA_NUM_PARALLEL=4
           export OLLAMA_MAX_LOADED_MODELS=2
+          export OLLAMA_KEEP_ALIVE=-1
           
           nohup ollama serve > ollama.log 2>&1 &
           
+          # Wait for Ollama to be ready with retry
           for i in {1..30}; do
             if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-              echo "Ollama server is ready"
+              echo "✅ Ollama server is ready"
               break
             fi
+            if [ $i -eq 30 ]; then
+              echo "❌ Ollama server failed to start"
+              cat ollama.log
+              exit 1
+            fi
+            echo "Waiting for Ollama server... ($i/30)"
             sleep 2
           done
       
-      - name: Pull and Run Gemma 4 E4B
+      - name: Pull Gemma 4 E4B Model
         run: |
-          ollama run gemma4:e4b
+          echo "📥 Pulling gemma4:e4b model (this may take 5-10 minutes)..."
+          ollama pull gemma4:e4b
+          
+          # Verify model is pulled
+          if ollama list | grep -q "gemma4:e4b"; then
+            echo "✅ Model pulled successfully"
+          else
+            echo "❌ Model pull failed"
+            exit 1
+          fi
       
-      - name: Create GPT-4 Alias
+      - name: Test Gemma 4 Model
+        run: |
+          echo "🧪 Testing model..."
+          TEST_RESPONSE=$(curl -X POST http://localhost:11434/api/generate \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "gemma4:e4b",
+              "prompt": "Say exactly: READY",
+              "stream": false
+            }' | jq -r '.response')
+          
+          if [[ "$TEST_RESPONSE" == *"READY"* ]]; then
+            echo "✅ Model test passed: $TEST_RESPONSE"
+          else
+            echo "❌ Model test failed"
+            echo "Response: $TEST_RESPONSE"
+            exit 1
+          fi
+      
+      - name: Create Model Aliases for Continue
         run: |
           ollama cp gemma4:e4b gpt-4o
           ollama cp gemma4:e4b codestral
+          echo "✅ Aliases created: gpt-4o, codestral"
       
       - name: Install cloudflared
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
+          cloudflared --version
+          echo "✅ cloudflared installed"
       
       - name: Create Cloudflare Tunnel
         id: tunnel
         run: |
+          # Start tunnel with proper headers and keepalive
           cloudflared tunnel --url http://localhost:11434 \
             --http-host-header localhost:11434 \
+            --protocol http2 \
+            --keepalive 30s \
             --logfile cloudflared.log &
           
-          sleep 15
+          # Wait for tunnel to establish
+          sleep 20
           
+          # Extract tunnel URL
           TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ Failed to get tunnel URL"
+            echo "Cloudflared log:"
+            cat cloudflared.log
+            exit 1
+          fi
           
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
           
+          # Test tunnel is working
+          echo "🔍 Testing tunnel..."
+          if curl -s "$TUNNEL_URL/api/tags" > /dev/null; then
+            echo "✅ Tunnel is working"
+          else
+            echo "⚠️ Tunnel test failed, but continuing..."
+          fi
+          
           echo ""
-          echo "=========================================="
-          echo "TUNNEL ACTIVE: $TUNNEL_URL"
-          echo "=========================================="
+          echo "╔════════════════════════════════════════════════════════════════╗"
+          echo "║                    ✅ TUNNEL IS ACTIVE!                         ║"
+          echo "╚════════════════════════════════════════════════════════════════╝"
           echo ""
-          echo "VS CODE CONTINUE CONFIG:"
+          echo "🌐 PUBLIC URL: $TUNNEL_URL"
           echo ""
-          echo '{
-            "models": [
-              {
-                "title": "Gemma 4 E4B",
-                "provider": "openai",
-                "model": "gpt-4o",
-                "apiBase": "'$TUNNEL_URL'/v1",
-                "apiKey": "ollama",
-                "capabilities": ["tool_use"],
-                "supportsTools": true,
-                "requestOptions": {
-                  "headers": {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                  }
-                }
-              }
-            ],
-            "tabAutocompleteModel": {
-              "title": "Code Completion",
-              "provider": "openai",
-              "model": "codestral",
-              "apiBase": "'$TUNNEL_URL'/v1",
-              "apiKey": "ollama"
-            }
-          }'
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "=========================================="
+          echo "📋 COPY THIS ENTIRE CONFIGURATION for VS Code Continue:"
+          echo ""
+          cat << 'EOF'
+{
+  "models": [
+    {
+      "title": "Gemma 4 E4B",
+      "provider": "ollama",
+      "model": "gemma4:e4b",
+      "apiBase": "EOF
+          echo -n "$TUNNEL_URL"
+          cat << 'EOF'
+",
+      "roles": ["chat", "edit", "apply"],
+      "capabilities": ["tool_use"],
+      "requestOptions": {
+        "headers": {
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        "timeout": 120000
+      },
+      "completionOptions": {
+        "temperature": 1.0,
+        "topP": 0.95,
+        "topK": 64
+      }
+    }
+  ],
+  "tabAutocompleteModel": {
+    "provider": "ollama",
+    "model": "gemma4:e4b",
+    "apiBase": "EOF
+          echo -n "$TUNNEL_URL"
+          cat << 'EOF'
+",
+    "requestOptions": {
+      "headers": {
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      "timeout": 60000
+    }
+  }
+}
+EOF
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "🧪 QUICK TEST COMMANDS:"
+          echo "   curl $TUNNEL_URL/api/tags"
+          echo "   curl $TUNNEL_URL/api/generate -d '{\"model\":\"gemma4:e4b\",\"prompt\":\"Hi\"}'"
+          echo ""
+          echo "⏱️  Tunnel will remain active for ${{ github.event.inputs.duration }} hours"
+          echo ""
       
-      - name: Keep Runner Alive
+      - name: Keep Runner Alive with Heartbeat
         run: |
-          echo "Tunnel active for ${{ github.event.inputs.duration }} hours"
-          echo "Connect via: ${{ steps.tunnel.outputs.tunnel_url }}"
-          sleep ${{ github.event.inputs.duration }}h
+          TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          DURATION_HOURS=${{ github.event.inputs.duration }}
+          DURATION_SECONDS=$((DURATION_HOURS * 3600))
+          ELAPSED=0
+          
+          echo "🟢 Tunnel active at: $TUNNEL_URL"
+          echo "🟢 Will run for $DURATION_HOURS hours"
+          echo "🟢 Press 'Cancel workflow' in GitHub Actions to stop early"
+          echo ""
+          
+          while [ $ELAPSED -lt $DURATION_SECONDS ]; do
+            # Send heartbeat every 60 seconds
+            if curl -s "$TUNNEL_URL/api/tags" > /dev/null 2>&1; then
+              echo "✅ [$(date '+%H:%M:%S')] Heartbeat OK - Tunnel responding"
+            else
+              echo "⚠️ [$(date '+%H:%M:%S')] Heartbeat WARNING - Tunnel not responding"
+              # Try to re-establish tunnel if down
+              pkill cloudflared || true
+              cloudflared tunnel --url http://localhost:11434 --http-host-header localhost:11434 &
+              sleep 10
+            fi
+            
+            sleep 60
+            ELAPSED=$((ELAPSED + 60))
+            
+            # Show progress every hour
+            if [ $((ELAPSED % 3600)) -eq 0 ]; then
+              HOURS_REMAINING=$(((DURATION_SECONDS - ELAPSED) / 3600))
+              echo "📊 Status: $((ELAPSED / 3600))/$DURATION_HOURS hours elapsed, $HOURS_REMAINING hours remaining"
+            fi
+          done
+          
+          echo ""
+          echo "⏰ Workflow completed after $DURATION_HOURS hours"
+      
+      - name: Cleanup on Failure
+        if: failure()
+        run: |
+          echo "❌ Workflow failed. Collecting logs..."
+          echo ""
+          echo "=== OLLAMA LOGS ==="
+          tail -50 ollama.log 2>/dev/null || echo "No ollama.log found"
+          echo ""
+          echo "=== CLOUDFLARE LOGS ==="
+          tail -50 cloudflared.log 2>/dev/null || echo "No cloudflared.log found"
+          echo ""
+          echo "=== OLLAMA PROCESS STATUS ==="
+          ps aux | grep ollama || echo "Ollama not running"
+          echo ""
+          echo "=== PORT STATUS ==="
+          netstat -tlnp 2>/dev/null | grep 11434 || echo "Port 11434 not listening"
