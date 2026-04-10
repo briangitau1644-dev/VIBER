@@ -74,18 +74,26 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           
-          cmake --build . --config Release --target server -j$(nproc)
+          # Build default targets (includes server) to avoid target name mismatches
+          cmake --build . --config Release -j$(nproc)
           
-          if [ ! -f "./bin/server" ] && [ ! -f "./server" ]; then
-            echo "❌ Server binary not found after build"
-            ls -la
-            exit 1
-          fi
-          
+          # Find the server binary (location varies by llama.cpp version)
+          SERVER_BIN=""
           if [ -f "./bin/server" ]; then
             SERVER_BIN="./bin/server"
-          else
+          elif [ -f "./server" ]; then
             SERVER_BIN="./server"
+          elif [ -f "./bin/llama-server" ]; then
+            SERVER_BIN="./bin/llama-server"
+          elif [ -f "./llama-server" ]; then
+            SERVER_BIN="./llama-server"
+          fi
+          
+          if [ -z "$SERVER_BIN" ]; then
+            echo "❌ Server binary not found after build"
+            echo "Searching for executable..."
+            find .. -type f -executable -name "*server*" 2>/dev/null || echo "(none)"
+            exit 1
           fi
           
           echo "✅ llama.cpp server built: $SERVER_BIN"
@@ -154,12 +162,6 @@ jobs:
       - name: 🚀 Start llama.cpp Server (OpenAI-compatible API)
         run: |
           cd llama.cpp
-          
-          if [ -f "./bin/server" ]; then
-            SERVER_BIN="./bin/server"
-          else
-            SERVER_BIN="./server"
-          fi
           
           echo "🚀 Starting llama.cpp server..."
           echo "   Model: $MODEL_PATH"
@@ -386,17 +388,12 @@ jobs:
             HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null || echo '{"status":"down"}')
             echo "🟢 Server local: $(echo "$HEALTH" | jq -r .status 2>/dev/null || echo unreachable)"
 
-            SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "./server" || true)
+            SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "./server" || pgrep -f "llama-server" || true)
             if [ -n "$SERVER_PIDS" ]; then
               echo "🦙 Server: alive (PIDs: $SERVER_PIDS)"
             else
               echo "❌ Server not found — restarting..."
               cd llama.cpp
-              if [ -f "./bin/server" ]; then
-                SERVER_BIN="./bin/server"
-              else
-                SERVER_BIN="./server"
-              fi
               nohup $SERVER_BIN \
                 --model "../$MODEL_PATH" \
                 --host "$SERVER_HOST" \
@@ -454,6 +451,7 @@ jobs:
           pkill -9 -f cloudflared 2>/dev/null || true
           pkill -9 -f "llama.cpp.*server" 2>/dev/null || true
           pkill -9 -f "./server" 2>/dev/null || true
+          pkill -9 -f "llama-server" 2>/dev/null || true
           sudo fuser -k $SERVER_PORT/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
           echo "✅ Done"
