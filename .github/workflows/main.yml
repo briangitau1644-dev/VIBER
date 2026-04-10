@@ -1,30 +1,42 @@
-name: Ollama Direct — gemma4:e4b — RAM-Resident + Cloudflare Tunnel
+name: LM Studio Direct — gemma4:e4b — llama.cpp Server + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
     inputs:
-      model:
-        description: 'Ollama model to use'
+      model_repo:
+        description: 'HuggingFace model repo (GGUF)'
         required: false
-        default: 'gemma4:e4b'
+        default: 'bartowski/gemma-2-9b-it-GGUF'
+      model_file:
+        description: 'GGUF filename to use'
+        required: false
+        default: 'gemma-2-9b-it-Q4_K_M.gguf'
       session_hours:
         description: 'Session duration in hours (max 6)'
         required: false
         default: '6'
+      ctx_size:
+        description: 'Context size (tokens)'
+        required: false
+        default: '4096'
+      n_gpu_layers:
+        description: 'GPU layers (-1 = all, 0 = CPU)'
+        required: false
+        default: '-1'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL: ${{ github.event.inputs.model || 'gemma4:e4b' }}
-  OLLAMA_PORT: '11434'
+  MODEL_REPO: ${{ github.event.inputs.model_repo || 'bartowski/gemma-2-9b-it-GGUF' }}
+  MODEL_FILE: ${{ github.event.inputs.model_file || 'gemma-2-9b-it-Q4_K_M.gguf' }}
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  OLLAMA_KEEP_ALIVE: '-1'
-  OLLAMA_MAX_LOADED_MODELS: '1'
-  OLLAMA_NUM_PARALLEL: '4'
-  OLLAMA_FLASH_ATTENTION: '1'
+  CTX_SIZE: ${{ github.event.inputs.ctx_size || '4096' }}
+  N_GPU_LAYERS: ${{ github.event.inputs.n_gpu_layers || '-1' }}
+  SERVER_PORT: '1234'
+  SERVER_HOST: '0.0.0.0'
 
 jobs:
-  ollama-direct:
-    name: Ollama Direct + gemma4:e4b + RAM-Resident + Cloudflare Tunnel
+  lm-studio-direct:
+    name: llama.cpp Server + gemma-2-9b + Cloudflare Tunnel
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
@@ -35,13 +47,85 @@ jobs:
       - name: 📥 Install System Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget jq grep bash procps
+          sudo apt-get install -y -qq \
+            curl wget jq grep bash procps cmake build-essential \
+            git libcurl4-openssl-dev
 
-      - name: 📥 Install Ollama (latest)
+      - name: 📥 Build llama.cpp (with server + OpenAI API)
         run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama --version
-          echo "✅ Ollama installed"
+          git clone --depth 1 --branch b4300 https://github.com/ggerganov/llama.cpp
+          cd llama.cpp
+          make server -j$(nproc) LLAMA_CURL=1
+          ./server --help | head -20
+          echo "✅ llama.cpp server built"
+
+      - name: 📥 Download Model (GGUF)
+        run: |
+          echo "⏳ Downloading model: ${{ env.MODEL_REPO }} / ${{ env.MODEL_FILE }}"
+          
+          # Create models directory
+          mkdir -p models
+          
+          # Download from HuggingFace (using hf.co direct link)
+          MODEL_URL="https://huggingface.co/${{ env.MODEL_REPO }}/resolve/main/${{ env.MODEL_FILE }}"
+          
+          if ! curl -fL --retry 3 --retry-delay 10 \
+            -o "models/${{ env.MODEL_FILE }}" \
+            "$MODEL_URL"; then
+            echo "❌ Failed to download model"
+            echo "Trying alternative mirror..."
+            # Fallback: try with ?download=1
+            curl -fL --retry 3 --retry-delay 10 \
+              -o "models/${{ env.MODEL_FILE }}" \
+              "${MODEL_URL}?download=1" || exit 1
+          fi
+          
+          # Verify download
+          if [ ! -f "models/${{ env.MODEL_FILE }}" ]; then
+            echo "❌ Model file not found after download"
+            exit 1
+          fi
+          
+          FILE_SIZE=$(du -h "models/${{ env.MODEL_FILE }}" | cut -f1)
+          echo "✅ Model downloaded: $FILE_SIZE"
+          ls -lh models/
+
+      - name: 🚀 Start llama.cpp Server (OpenAI-compatible API)
+        run: |
+          cd llama.cpp
+          
+          # Start server in background with OpenAI API compatibility
+          nohup ./server \
+            --model "../models/${{ env.MODEL_FILE }}" \
+            --host "${{ env.SERVER_HOST }}" \
+            --port "${{ env.SERVER_PORT }}" \
+            --ctx-size "${{ env.CTX_SIZE }}" \
+            --n-gpu-layers ${{ env.N_GPU_LAYERS }} \
+            --chat-template gemma \
+            --slots \
+            --log-disable \
+            > ../server.log 2>&1 &
+          
+          echo $! > ../server.pid
+          echo "⏳ Waiting for llama.cpp server to be ready..."
+          
+          # Wait for server to respond
+          for i in {1..60}; do
+            if curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/health" > /dev/null 2>&1; then
+              echo "✅ Server ready after ${i} attempts"
+              break
+            fi
+            [ $i -eq 60 ] && { 
+              echo "❌ Server did not start"
+              cat ../server.log | tail -50
+              exit 1
+            }
+            sleep 3
+          done
+          
+          # Verify OpenAI-compatible endpoint
+          echo "📦 Testing /v1/models endpoint..."
+          curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/v1/models" | jq . || echo "(no models endpoint)"
 
       - name: 📥 Install Cloudflared
         run: |
@@ -52,67 +136,14 @@ jobs:
           cloudflared --version
           echo "✅ Cloudflared installed"
 
-      - name: 🚀 Start Ollama Server (RAM-optimised)
-        run: |
-          # Kernel tuning for better RAM retention
-          sudo sysctl -w vm.swappiness=10 2>/dev/null || true
-          sudo sysctl -w vm.dirty_ratio=60 2>/dev/null || true
-
-          # Ollama environment
-          export OLLAMA_HOST="0.0.0.0:${{ env.OLLAMA_PORT }}"
-          export OLLAMA_ORIGINS="*"
-          export OLLAMA_KEEP_ALIVE="${{ env.OLLAMA_KEEP_ALIVE }}"
-          export OLLAMA_MAX_LOADED_MODELS="${{ env.OLLAMA_MAX_LOADED_MODELS }}"
-          export OLLAMA_NUM_PARALLEL="${{ env.OLLAMA_NUM_PARALLEL }}"
-          export OLLAMA_FLASH_ATTENTION="${{ env.OLLAMA_FLASH_ATTENTION }}"
-
-          # Start Ollama in background
-          nohup ollama serve > ollama.log 2>&1 &
-          echo $! > ollama.pid
-          echo "⏳ Waiting for Ollama to be ready..."
-
-          # Wait for Ollama to respond
-          for i in {1..40}; do
-            if curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version > /dev/null 2>&1; then
-              echo "✅ Ollama ready after ${i} attempts"
-              break
-            fi
-            [ $i -eq 40 ] && { echo "❌ Ollama did not start"; cat ollama.log; exit 1; }
-            sleep 2
-          done
-
-          echo "📦 Ollama version: $(curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version | jq -r .version)"
-
-      - name: 📥 Pull and Pre-Load Model into RAM
-        run: |
-          echo "⏳ Pulling model: ${{ env.MODEL }}"
-          if ! timeout 1200 ollama pull ${{ env.MODEL }}; then
-            echo "❌ Failed to pull model"
-            ollama list
-            tail -30 ollama.log
-            exit 1
-          fi
-
-          echo "✅ Model pulled. Forcing load into RAM with keep_alive=-1..."
-          
-          # Warm-up request to load weights into RAM permanently
-          curl -sf --max-time 300 \
-            -X POST http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/generate \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"${{ env.MODEL }}\",\"prompt\":\"ready\",\"stream\":false,\"keep_alive\":-1,\"options\":{\"num_predict\":1}}" \
-            > /dev/null 2>&1
-
-          echo "📋 Model status (/api/ps):"
-          curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/ps | jq . || echo "(no /api/ps endpoint)"
-
-      - name: 🌐 Start Cloudflare Tunnel → Ollama Direct
+      - name: 🌐 Start Cloudflare Tunnel → llama.cpp Server
         run: |
           pkill -9 -f cloudflared 2>/dev/null || true
           sleep 2
 
-          # ⚠️ TUNNEL DIRECTLY TO OLLAMA PORT (11434), NO PROXY
+          # Tunnel directly to llama.cpp server port (1234)
           nohup cloudflared tunnel \
-            --url http://127.0.0.1:${{ env.OLLAMA_PORT }} \
+            --url http://127.0.0.1:${{ env.SERVER_PORT }} \
             --no-autoupdate \
             --loglevel info \
             > tunnel.log 2>&1 &
@@ -135,13 +166,13 @@ jobs:
           if [ -n "$TUNNEL_URL" ]; then
             echo "CLOUDFLARE_URL=${TUNNEL_URL}" >> "$GITHUB_ENV"
 
-            # Verify tunnel responds with raw Ollama API
-            echo "⏳ Verifying tunnel serves raw Ollama API..."
+            # Verify tunnel serves OpenAI-compatible API
+            echo "⏳ Verifying tunnel serves OpenAI API..."
             for j in {1..20}; do
-              RESPONSE=$(curl -sf --max-time 10 "${TUNNEL_URL}/api/version" 2>/dev/null || echo "")
-              if echo "$RESPONSE" | jq -e '.version' > /dev/null 2>&1; then
-                echo "✅ Tunnel verified — serving raw Ollama API"
-                echo "   Response: $RESPONSE"
+              RESPONSE=$(curl -sf --max-time 10 "${TUNNEL_URL}/v1/models" 2>/dev/null || echo "")
+              if echo "$RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
+                echo "✅ Tunnel verified — serving OpenAI-compatible API"
+                echo "   Models: $(echo "$RESPONSE" | jq -r '.data[].id' 2>/dev/null | head -3)"
                 break
               fi
               echo "  Attempt $j — waiting for tunnel..."
@@ -152,36 +183,38 @@ jobs:
             # Print client config
             echo ""
             echo "╔════════════════════════════════════════════════════════════════╗"
-            echo "║   🦙  OLLAMA DIRECT — gemma4:e4b — READY                       ║"
+            echo "║   🦙  LM STUDIO DIRECT — llama.cpp Server — READY              ║"
             echo "╠════════════════════════════════════════════════════════════════╣"
             printf "║  Tunnel URL: %-52s║\n" "${TUNNEL_URL}"
+            printf "║  Model:      %-52s║\n" "${{ env.MODEL_FILE }}"
             echo "║                                                                  ║"
-            echo "║  ✅ USE THIS URL DIRECTLY IN YOUR CLIENT:                       ║"
+            echo "║  ✅ USE THIS IN LM STUDIO / CONTINUE / ROO CODE:                ║"
             echo "║                                                                  ║"
-            echo "║  [Open WebUI / Ollama CLI / Any Ollama client]                  ║"
-            printf "║    Base URL: %-54s║\n" "${TUNNEL_URL}"
-            printf "║    Model:    %-54s║\n" "${MODEL}"
+            printf "║    Server URL: %-52s║\n" "${TUNNEL_URL}"
+            printf "║    Model ID:   %-52s║\n" "${{ env.MODEL_FILE }}"
             echo "║                                                                  ║"
-            echo "║  [OpenAI-compatible clients]                                    ║"
-            printf "║    apiBase:  %-54s║\n" "${TUNNEL_URL}/v1"
-            printf "║    model:    %-54s║\n" "${MODEL}"
+            echo "║  ✅ OpenAI-Compatible Endpoints:                                ║"
+            echo "║    • GET  /v1/models       — List available models              ║"
+            echo "║    • POST /v1/chat/completions — Chat with model               ║"
+            echo "║    • POST /v1/completions  — Legacy completions                 ║"
+            echo "║    • GET  /health          — Server health check                ║"
             echo "║                                                                  ║"
-            echo "║  ⚠️  NO PROXY — This is raw Ollama API                          ║"
-            echo "║     Visit ${TUNNEL_URL}/api/tags to see models           ║"
+            echo "║  ⚠️  Note: Custom server-side tools are not available.          ║"
+            echo "║     Use client-side function calling for tools.                 ║"
             echo "╚════════════════════════════════════════════════════════════════╝"
             echo ""
-            echo "==> Direct Ollama: ${TUNNEL_URL}"
-            echo "==> OpenAI compat: ${TUNNEL_URL}/v1"
+            echo "==> Server URL: ${TUNNEL_URL}"
+            echo "==> Model ID:   ${{ env.MODEL_FILE }}"
           fi
 
-      - name: 🧪 Test Direct Ollama Endpoints
+      - name: 🧪 Test OpenAI-Compatible Endpoints
         if: env.CLOUDFLARE_URL != ''
         run: |
           BASE="${{ env.CLOUDFLARE_URL }}"
-          BASE="${BASE%/}"  # strip trailing slash
+          BASE="${BASE%/}"
 
           echo "═══════════════════════════════════════════════"
-          echo "🧪 Testing DIRECT Ollama endpoints"
+          echo "🧪 Testing OpenAI-compatible endpoints"
           echo "   BASE = ${BASE}"
           echo "═══════════════════════════════════════════════"
 
@@ -226,36 +259,36 @@ jobs:
           }
 
           echo ""
-          echo "1️⃣  GET /api/version (raw Ollama)"
-          R=$(do_get "${BASE}/api/version"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /api/version" "$B" "$CODE"
+          echo "1️⃣  GET /v1/models"
+          R=$(do_get "${BASE}/v1/models"); CODE="${R%%|*}"; B="${R#*|}"
+          check "GET /v1/models" "$B" "$CODE"
+          echo "$B" | jq '.data[].id' 2>/dev/null || true
+          echo ""
+
+          echo "2️⃣  GET /health"
+          R=$(do_get "${BASE}/health"); CODE="${R%%|*}"; B="${R#*|}"
+          check "GET /health" "$B" "$CODE"
           echo "$B" | jq . 2>/dev/null || true
           echo ""
 
-          echo "2️⃣  GET /api/tags (raw Ollama)"
-          R=$(do_get "${BASE}/api/tags"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /api/tags" "$B" "$CODE"
-          echo "$B" | jq '.models[].name' 2>/dev/null || true
+          echo "3️⃣  POST /v1/chat/completions (non-streaming)"
+          DATA='{"model":"${{ env.MODEL_FILE }}","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
+          R=$(do_post "${BASE}/v1/chat/completions" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
+          check "POST /v1/chat/completions" "$B" "$CODE"
+          echo "$B" | jq '{finish:.choices[0].finish_reason, reply:.choices[0].message.content}' 2>/dev/null || true
           echo ""
 
-          echo "3️⃣  GET /api/ps (raw Ollama)"
-          R=$(do_get "${BASE}/api/ps"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /api/ps" "$B" "$CODE"
-          echo "$B" | jq '.models[].name' 2>/dev/null || true
-          echo ""
-
-          echo "4️⃣  POST /api/generate (raw Ollama)"
-          DATA="{\"model\":\"${{ env.MODEL }}\",\"prompt\":\"hi\",\"stream\":false,\"options\":{\"num_predict\":5}}"
-          R=$(do_post "${BASE}/api/generate" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
-          check "POST /api/generate" "$B" "$CODE"
-          echo "$B" | jq '{response, done}' 2>/dev/null || true
-          echo ""
-
-          echo "5️⃣  POST /api/chat (raw Ollama)"
-          DATA="{\"model\":\"${{ env.MODEL }}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false}"
-          R=$(do_post "${BASE}/api/chat" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
-          check "POST /api/chat" "$B" "$CODE"
-          echo "$B" | jq '{message, done}' 2>/dev/null || true
+          echo "4️⃣  POST /v1/chat/completions (streaming)"
+          DATA='{"model":"${{ env.MODEL_FILE }}","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"stream":true}'
+          CODE=$(curl -s --max-time 30 -H "Content-Type: application/json" -d "$DATA" \
+            -w "%{http_code}" -o /dev/null "${BASE}/v1/chat/completions" 2>/dev/null || echo "000")
+          if [ "$CODE" = "200" ]; then
+            echo "✅ POST /v1/chat/completions (stream) (HTTP $CODE)"
+            PASS=$((PASS+1))
+          else
+            echo "❌ POST /v1/chat/completions (stream) (HTTP $CODE)"
+            FAIL=$((FAIL+1))
+          fi
           echo ""
 
           echo "═══════════════════════════════════════════════"
@@ -284,42 +317,35 @@ jobs:
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "⏰ $(date '+%Y-%m-%d %H:%M:%S UTC') | ${REMAIN_MIN}m remaining"
 
-            # Direct Ollama health via tunnel
+            # Tunnel health via OpenAI endpoint
             if [ -n "$CF_URL" ]; then
-              VER=$(curl -sf --max-time 10 "${CF_URL}/api/version" 2>/dev/null | jq -r .version 2>/dev/null || echo "unreachable")
-              echo "🟢 Ollama via tunnel: $VER"
+              MODELS=$(curl -sf --max-time 10 "${CF_URL}/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null | head -1 || echo "unreachable")
+              echo "🟢 Server via tunnel: ${MODELS:-unreachable}"
             fi
 
-            # Local Ollama check
-            VER_LOCAL=$(curl -sf --max-time 5 "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version" 2>/dev/null | jq -r .version 2>/dev/null || echo "unreachable")
-            echo "🟢 Ollama local: $VER_LOCAL"
-
-            # RAM check — reload model if evicted
-            PS=$(curl -sf --max-time 5 "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/ps" 2>/dev/null || echo '{"models":[]}')
-            COUNT=$(echo "$PS" | jq '.models|length' 2>/dev/null || echo 0)
-            echo "🧠 Models in RAM: $COUNT"
-
-            if [ "${COUNT}" -eq "0" ]; then
-              echo "⚠️  Model evicted — reloading with keep_alive=-1..."
-              curl -sf --max-time 90 \
-                -X POST "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/generate" \
-                -H "Content-Type: application/json" \
-                -d "{\"model\":\"${{ env.MODEL }}\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":-1,\"options\":{\"num_predict\":1}}" \
-                > /dev/null 2>&1 \
-                && echo "✅ Reloaded" || echo "❌ Reload failed"
-            fi
+            # Local server health
+            HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:${{ env.SERVER_PORT }}/health" 2>/dev/null || echo '{"status":"down"}')
+            echo "🟢 Server local: $(echo "$HEALTH" | jq -r .status 2>/dev/null || echo unreachable)"
 
             # Process check
-            OLLAMA_PIDS=$(pgrep -f "ollama serve" || true)
-            if [ -n "$OLLAMA_PIDS" ]; then
-              echo "🦙 Ollama: alive (PIDs: $OLLAMA_PIDS)"
+            SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "./server" || true)
+            if [ -n "$SERVER_PIDS" ]; then
+              echo "🦙 Server: alive (PIDs: $SERVER_PIDS)"
             else
-              echo "❌ Ollama not found — restarting..."
-              export OLLAMA_HOST="0.0.0.0:${{ env.OLLAMA_PORT }}"
-              export OLLAMA_KEEP_ALIVE="-1"
-              nohup ollama serve > ollama.log 2>&1 &
+              echo "❌ Server not found — restarting..."
+              cd llama.cpp
+              nohup ./server \
+                --model "../models/${{ env.MODEL_FILE }}" \
+                --host "${{ env.SERVER_HOST }}" \
+                --port "${{ env.SERVER_PORT }}" \
+                --ctx-size "${{ env.CTX_SIZE }}" \
+                --n-gpu-layers ${{ env.N_GPU_LAYERS }} \
+                --chat-template gemma \
+                --slots \
+                --log-disable \
+                > ../server.log 2>&1 &
               sleep 5
-              echo "🦙 Ollama restarted"
+              echo "🦙 Server restarted"
             fi
 
             echo "💾 $(free -h | awk '/^Mem/{printf "RAM: %s / %s", $3, $2}')"
@@ -334,23 +360,23 @@ jobs:
         if: always()
         run: |
           echo "╔══════════════════════════════════════════════╗"
-          echo "║           FINAL REPORT — OLLAMA DIRECT       ║"
+          echo "║        FINAL REPORT — LM STUDIO DIRECT       ║"
           echo "╚══════════════════════════════════════════════╝"
           RAW="${{ env.CLOUDFLARE_URL }}"
           CF="${RAW//__/}"
           [ -n "$CF" ] && echo "🌐 $CF"
 
           echo ""
-          echo "── Tunnel Test (/api/version) ──"
-          curl -sf "${CF}/api/version" 2>/dev/null | jq . || echo "unreachable"
+          echo "── Tunnel Test (/v1/models) ──"
+          curl -sf "${CF}/v1/models" 2>/dev/null | jq . || echo "unreachable"
 
           echo ""
-          echo "── Local Ollama (/api/ps) ──"
-          curl -sf "http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/ps" 2>/dev/null | jq . || echo "unreachable"
+          echo "── Local Server Health ──"
+          curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/health" 2>/dev/null | jq . || echo "unreachable"
 
           echo ""
-          echo "── ollama.log (last 20 lines) ──"
-          tail -20 ollama.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+          echo "── server.log (last 30 lines) ──"
+          tail -30 server.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
 
           echo ""
           echo "── tunnel.log (last 10 lines) ──"
@@ -361,9 +387,10 @@ jobs:
         run: |
           echo "🧹 Cleanup..."
           [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
-          [ -f ollama.pid ] && kill -9 "$(cat ollama.pid)" 2>/dev/null || true
+          [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
           pkill -9 -f cloudflared 2>/dev/null || true
-          pkill -9 -f "ollama serve" 2>/dev/null || true
-          sudo fuser -k ${{ env.OLLAMA_PORT }}/tcp 2>/dev/null || true
+          pkill -9 -f "llama.cpp.*server" 2>/dev/null || true
+          pkill -9 -f "./server" 2>/dev/null || true
+          sudo fuser -k ${{ env.SERVER_PORT }}/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
           echo "✅ Done"
