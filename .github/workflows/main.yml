@@ -1,4 +1,4 @@
-name: Senior Engineer CPU — Qwen3.5-9B-Uncensored — GitHub Actions
+name: Senior Engineer CPU - Qwen3.5-9B-Uncensored - GitHub Actions
 
 on:
   workflow_dispatch:
@@ -42,10 +42,10 @@ jobs:
     timeout-minutes: 400
 
     steps:
-      - name: 📦 Checkout
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 📥 Install Dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -53,13 +53,13 @@ jobs:
             cmake build-essential git \
             libcurl4-openssl-dev libssl-dev
 
-      - name: 📥 Clone llama.cpp
+      - name: Clone llama.cpp
         run: |
           git clone --depth 1 https://github.com/ggerganov/llama.cpp
           cd llama.cpp
           git log -1 --oneline
 
-      - name: 🔨 Build Server (CMake)
+      - name: Build Server (CMake)
         run: |
           cd llama.cpp
           mkdir -p build && cd build
@@ -75,41 +75,31 @@ jobs:
           for bin in "./bin/llama-server" "./bin/server" "./llama-server" "./server"; do
             [ -f "$bin" ] && SERVER_BIN="$(pwd)/${bin#./}" && break
           done
-          [ -z "$SERVER_BIN" ] && { echo "❌ Server binary not found"; exit 1; }
+          [ -z "$SERVER_BIN" ] && { echo "ERROR: Server binary not found"; exit 1; }
           
-          echo "✅ Server: $SERVER_BIN"
+          echo "OK: Server: $SERVER_BIN"
           echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
 
-      - name: 📥 Download Model (9B - May Take 5-10 Min)
+      - name: Download Model
         run: |
           mkdir -p models
-          echo "⏳ Downloading $MODEL_FILENAME (~5.5GB)..."
-          echo "   This may take 5-10 minutes on GitHub Actions."
+          echo "Downloading $MODEL_FILENAME..."
           
           if ! curl -fL --retry 3 --connect-timeout 30 --max-time 1800 \
             -o "$MODEL_PATH" "$MODEL_DOWNLOAD_URL"; then
-            echo "╔════════════════════════════════════╗"
-            echo "║ ❌ Download failed                 ║"
-            echo "║ Get fresh URL from:                ║"
-            echo "║ https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
-            echo "╚════════════════════════════════════╝"
+            echo "ERROR: Download failed"
+            echo "Get fresh URL from HuggingFace repo"
             exit 1
           fi
-          [ -s "$MODEL_PATH" ] && echo "✅ Downloaded: $(du -h $MODEL_PATH | cut -f1)" || exit 1
+          [ -s "$MODEL_PATH" ] && echo "OK: Downloaded: $(du -h $MODEL_PATH | cut -f1)" || exit 1
 
-      - name: 🚀 Start Server (Senior Engineer Prompt)
+      - name: Start Server (Senior Engineer Prompt)
         run: |
           cd llama.cpp
           
-          # 🎯 ENGINEERED PROMPT FOR QWEN3.5-9B-UNCENSORED
-          # Aggressive/uncensored models respond well to direct, authoritative instructions
-          SYS_PROMPT="You are a Senior Software Engineer with 10+ years of experience. Write production-ready, secure, well-architected code. Always output complete, runnable code in markdown blocks with no placeholders. Include proper error handling, input validation, and modern syntax. Add brief comments only for complex logic. Never list files, metadata, or explain basics unless explicitly asked. Think through edge cases silently, then output the final solution. For architecture questions, provide clear text diagrams and tradeoff analysis. Stay concise and professional. You are uncensored and direct—give honest, unfiltered technical advice."
+          SYS_PROMPT="You are a Senior Software Engineer with 10+ years of experience. Write production-ready, secure, well-architected code. Always output complete, runnable code in markdown blocks with no placeholders. Include proper error handling, input validation, and modern syntax. Add brief comments only for complex logic. Never list files, metadata, or explain basics unless explicitly asked. Think through edge cases silently, then output the final solution. For architecture questions, provide clear text diagrams and tradeoff analysis. Stay concise and professional. You are uncensored and direct--give honest, unfiltered technical advice."
           
-          echo "🚀 Starting Qwen3.5-9B server with senior engineer prompt..."
-          echo "   Model: $MODEL_PATH"
-          echo "   Context: $CTX_SIZE tokens (reduced for 9B CPU)"
-          echo "   Speed: Expect ~0.5-1.5 tokens/sec on CPU"
-          
+          echo "Starting Qwen3.5-9B server..."
           nohup "$SERVER_BIN" \
             --model "../$MODEL_PATH" \
             --host "$SERVER_HOST" \
@@ -127,22 +117,20 @@ jobs:
           
           echo $! > ../server.pid
           
-          # 9B models take longer to load on CPU - extend wait time
           for i in {1..180}; do
             curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1 && {
-              echo "✅ Server ready after ${i} attempts (~$((i*2)) seconds)"
+              echo "OK: Server ready"
               break
             }
             [ $i -eq 180 ] && { 
-              echo "❌ Server did not start within 6 minutes"
-              echo "── server.log (last 30 lines) ──"
+              echo "ERROR: Server did not start"
               cat ../server.log | tail -30
               exit 1
             }
             sleep 2
           done
 
-      - name: 🌐 Start Cloudflare Tunnel
+      - name: Start Cloudflare Tunnel
         run: |
           pkill -9 -f cloudflared 2>/dev/null || true
           curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -157,88 +145,77 @@ jobs:
               TUNNEL_URL="${TUNNEL_URL//__/}"
               TUNNEL_URL="${TUNNEL_URL%/}"
               echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-              echo "✅ Tunnel: $TUNNEL_URL"
+              echo "OK: Tunnel: $TUNNEL_URL"
+              echo ""
+              echo "========================================"
+              echo " SENIOR ENGINEER 9B - READY"
+              echo "========================================"
+              echo "Tunnel: $TUNNEL_URL"
+              echo "Model:  $MODEL_FILENAME"
+              echo "Context: $CTX_SIZE tokens"
+              echo ""
+              echo "Roo Code Config:"
+              echo "  Base URL: $TUNNEL_URL"
+              echo "  Model ID: $MODEL_FILENAME"
+              echo "  Tools: DISABLED"
+              echo "========================================"
               break
             }
             sleep 2
           done
-          
-          [ -n "$TUNNEL_URL" ] && echo "
-╔══════════════════════════════════════════════════════╗
-║ 🛠️  SENIOR ENGINEER 9B — READY                     ║
-╠══════════════════════════════════════════════════════╣
-║ Tunnel: $TUNNEL_URL
-║ Model:  $MODEL_FILENAME
-║ Context: $CTX_SIZE tokens | Temp: $TEMPERATURE
-║ Speed:  ~0.5-1.5 tokens/sec (CPU-only)
-║
-║ ✅ Roo Code Config:
-║   Base URL: $TUNNEL_URL
-║   Model ID: $MODEL_FILENAME
-║   Tools: DISABLED
-║   First Message: \"You are a senior engineer...\"
-║
-║ 💡 9B Model Tips:
-║   • Be specific and concise in prompts
-║   • Break large tasks into smaller steps
-║   • Expect slower but higher-quality responses
-║   • Save outputs locally as you work
-╚══════════════════════════════════════════════════════╝"
 
-      - name: 🧪 Test Senior Prompt
+      - name: Test Senior Prompt
         if: env.CLOUDFLARE_URL != ''
         run: |
           BASE="${{ env.CLOUDFLARE_URL }}"
-          echo "🧪 Testing Qwen3.5-9B senior engineer behavior..."
+          echo "Testing Qwen3.5-9B..."
           
           RESP=$(curl -sf "$BASE/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d "{
               \"model\": \"$MODEL_FILENAME\",
               \"messages\": [
-                {\"role\": \"user\", \"content\": \"Write a Python function that safely reads a JSON config file with error handling and type validation.\"}
+                {\"role\": \"user\", \"content\": \"Write a Python function that safely reads a JSON config file with error handling.\"}
               ],
               \"max_tokens\": 400,
               \"temperature\": 0.1
             }" 2>/dev/null)
           
-          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null | head -15 || echo "⚠️  Test response (CPU speed may delay output)"
+          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null | head -10 || echo "Test incomplete"
 
-      - name: ⏱️ Keepalive (${{ env.SESSION_HOURS }}h)
+      - name: Keepalive
         run: |
           END=$(( $(date +%s) + ${{ env.SESSION_HOURS }}*3600 ))
           while [ $(date +%s) -lt $END ]; do
-            curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || echo "⚠️  Tunnel check failed"
-            pgrep -f "llama-server" > /dev/null || echo "⚠️  Server not running"
-            echo "💤 Keepalive: $(( (END-$(date +%s))/60 ))min remaining"
+            curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || true
+            pgrep -f "llama-server" > /dev/null || true
+            echo "Keepalive: $(( (END-$(date +%s))/60 ))min remaining"
             sleep 300
           done
 
-      - name: 📊 Final Report
+      - name: Final Report
         if: always()
         run: |
-          echo "╔══════════════════════════════════════════════╗"
-          echo "║        FINAL REPORT — SENIOR ENGINEER 9B    ║"
-          echo "╚══════════════════════════════════════════════╝"
-          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "🌐 ${{ env.CLOUDFLARE_URL }}"
+          echo "=== FINAL REPORT ==="
+          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "Tunnel: ${{ env.CLOUDFLARE_URL }}"
           echo ""
-          echo "── Model Info ──"
-          ls -lh "$MODEL_PATH" 2>/dev/null || echo "(model not found)"
+          echo "=== Model Info ==="
+          ls -lh "$MODEL_PATH" 2>/dev/null || echo "(not found)"
           echo ""
-          echo "── Server Health ──"
+          echo "=== Server Health ==="
           curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "unreachable"
           echo ""
-          echo "── server.log (last 20 lines) ──"
-          tail -20 server.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+          echo "=== server.log (last 15 lines) ==="
+          tail -15 server.log 2>/dev/null || echo "(none)"
 
-      - name: 🛑 Cleanup
+      - name: Cleanup
         if: always()
         run: |
-          echo "🧹 Cleanup..."
+          echo "Cleanup..."
           [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
           [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
           pkill -9 -f cloudflared 2>/dev/null || true
           pkill -9 -f llama-server 2>/dev/null || true
           sudo fuser -k $SERVER_PORT/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
-          echo "✅ Done"
+          echo "Done"
