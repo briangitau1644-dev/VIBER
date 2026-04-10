@@ -49,35 +49,19 @@ jobs:
           python-version: '3.11'
 
       - name: 📥 Install System Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq curl wget lsof net-tools jq grep bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl wget lsof net-tools jq grep bash
 
       - name: 📥 Install Python Dependencies
         run: |
           pip install --upgrade pip --quiet
           pip install --quiet fastapi "uvicorn[standard]" requests pydantic starlette psutil
 
-      # ── Install the LATEST Ollama via the official install script ──────────
-      # The script fetches the newest release binary, so /api/chat is always
-      # available (added in 0.1.16, current release is well past that).
       - name: 📥 Install Ollama (latest)
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
-
-      # Confirm the version at CI time so the log is auditable
-      - name: 🔍 Verify Ollama supports /api/chat
-        run: |
-          VERSION=$(ollama --version 2>&1 | grep -oP '\d+\.\d+\.\d+' | head -1)
-          echo "Detected Ollama version: $VERSION"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-          # Require >= 0.1.16
-          if [ "$MAJOR" -gt 0 ] || [ "$MINOR" -gt 1 ] || ([ "$MINOR" -eq 1 ] && [ "$PATCH" -ge 16 ]); then
-            echo "✅ Version $VERSION supports /api/chat"
-          else
-            echo "❌ Version $VERSION is too old — /api/chat requires >= 0.1.16"
-            echo "   The proxy will fall back to /api/generate automatically,"
-            echo "   but tool calling will be unavailable."
-          fi
 
       - name: 📥 Install Cloudflared
         run: |
@@ -94,26 +78,13 @@ jobs:
           nohup ollama serve > ollama.log 2>&1 &
           echo $! > ollama.pid
 
-          echo "⏳ Waiting for Ollama to be ready..."
+          echo "⏳ Waiting for Ollama..."
           for i in {1..30}; do
-            curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version > /dev/null 2>&1 && \
-              echo "✅ Ollama ready after ${i}×2 s" && break
-            [ $i -eq 30 ] && echo "❌ Ollama did not start in time" && exit 1
+            curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/version \
+              > /dev/null 2>&1 && echo "✅ Ollama ready" && break
+            [ $i -eq 30 ] && echo "❌ Ollama did not start" && exit 1
             sleep 2
           done
-
-          # Confirm /api/chat is reachable before pulling (quick smoke-test)
-          echo "🔎 Probing /api/chat endpoint..."
-          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" \
-            -X POST http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/chat \
-            -H 'Content-Type: application/json' \
-            -d '{"model":"_probe_","messages":[{"role":"user","content":"hi"}],"stream":false}' || true)
-          # 200 = OK, 404 = model not found (but endpoint exists), anything else = endpoint missing
-          if [ "$STATUS" = "200" ] || [ "$STATUS" = "404" ] || [ "$STATUS" = "400" ]; then
-            echo "✅ /api/chat endpoint is present (HTTP $STATUS)"
-          else
-            echo "⚠️  /api/chat returned HTTP $STATUS — proxy will fall back to /api/generate"
-          fi
 
           echo "⏳ Pulling model: ${{ env.MODEL }}"
           if ! timeout 900 ollama pull ${{ env.MODEL }}; then
@@ -124,7 +95,7 @@ jobs:
           echo "✅ Model ready"
           ollama list
 
-      - name: 🚀 Start Proxy Server with System Tools
+      - name: 🚀 Start Proxy Server
         run: |
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp 2>/dev/null || true
 
@@ -137,17 +108,15 @@ jobs:
           export PROXY_PORT="${{ env.PROXY_PORT }}"
           export OLLAMA_PORT="${{ env.OLLAMA_PORT }}"
 
-          echo "📁 Setting up working directory: $WORKING_DIR"
           mkdir -p "$WORKING_DIR"
-
           nohup python3 proxy_server.py > proxy.log 2>&1 &
           echo $! > proxy.pid
 
-          echo "⏳ Waiting for proxy to be ready..."
+          echo "⏳ Waiting for proxy..."
           for i in {1..20}; do
-            curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health > /dev/null 2>&1 && \
-              echo "✅ Proxy ready after ${i}×3 s" && break
-            [ $i -eq 20 ] && echo "❌ Proxy failed to start" && tail -30 proxy.log && exit 1
+            curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health \
+              > /dev/null 2>&1 && echo "✅ Proxy ready" && break
+            [ $i -eq 20 ] && echo "❌ Proxy failed" && tail -30 proxy.log && exit 1
             sleep 3
           done
 
@@ -156,17 +125,17 @@ jobs:
 
       - name: 🌐 Start Cloudflare Tunnel
         run: |
-          echo "🌐 Starting Cloudflare tunnel..."
           pkill -9 -f cloudflared 2>/dev/null || true
           sleep 1
 
-          nohup cloudflared tunnel --url http://localhost:${{ env.PROXY_PORT }} > tunnel.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:${{ env.PROXY_PORT }} \
+            > tunnel.log 2>&1 &
           echo $! > tunnel.pid
 
-          echo "⏳ Waiting for tunnel URL..."
           TUNNEL_URL=""
           for i in {1..30}; do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' \
+              tunnel.log 2>/dev/null | head -1)
             [ -n "$TUNNEL_URL" ] && break
             sleep 2
           done
@@ -174,93 +143,117 @@ jobs:
           if [ -n "$TUNNEL_URL" ]; then
             echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
 
+            # ── Print connection instructions ──────────────────────────────
             echo ""
-            echo "╔══════════════════════════════════════════════════════════════╗"
-            echo "║   🤖  AGENTIC MODE READY — SYSTEM TOOLS ENABLED             ║"
-            echo "╠══════════════════════════════════════════════════════════════╣"
-            printf "║  🔗 %-59s║\n" "$TUNNEL_URL"
-            echo "║                                                              ║"
-            echo "║  ⚙️  Client Configuration:                                  ║"
-            printf "║  • api_base : %-47s║\n" "$TUNNEL_URL/v1"
-            printf "║  • model    : %-47s║\n" "${{ env.MODEL }}"
-            echo "║  • tools    : auto (includes system ops)                     ║"
-            echo "║                                                              ║"
-            echo "║  ⚠️  Client MUST prompt for permissions before:             ║"
-            echo "║     run_command, delete_*, edit_file, create_file            ║"
-            echo "╚══════════════════════════════════════════════════════════════╝"
-            echo "::notice::🌐 URL: $TUNNEL_URL"
+            echo "╔══════════════════════════════════════════════════════════════════╗"
+            echo "║   🤖  AGENTIC MODE READY — SYSTEM TOOLS ENABLED                 ║"
+            echo "╠══════════════════════════════════════════════════════════════════╣"
+            printf "║  🔗  %-63s║\n" "$TUNNEL_URL"
+            echo "║                                                                  ║"
+            echo "║  CLIENT CONFIGURATION (pick ONE of the two options below):       ║"
+            echo "║                                                                  ║"
+            echo "║  Option A — OpenAI-compatible clients (Continue, Roo, etc.)      ║"
+            printf "║    apiBase : %-52s║\n" "$TUNNEL_URL/v1"
+            printf "║    model   : %-52s║\n" "${{ env.MODEL }}"
+            echo "║                                                                  ║"
+            echo "║  Option B — Raw Ollama clients (Open WebUI, etc.)                ║"
+            printf "║    apiBase : %-52s║\n" "$TUNNEL_URL"
+            printf "║    model   : %-52s║\n" "${{ env.MODEL }}"
+            echo "║                                                                  ║"
+            echo "║  NOTE: Do NOT add a trailing slash to the URL                    ║"
+            echo "║                                                                  ║"
+            echo "╚══════════════════════════════════════════════════════════════════╝"
+            echo "::notice::Option A (OpenAI): $TUNNEL_URL/v1 | Option B (Ollama): $TUNNEL_URL"
           else
-            echo "❌ Tunnel URL not found within 60 s"
+            echo "❌ Tunnel URL not found"
             tail -30 tunnel.log
           fi
 
-      - name: 🧪 Test Endpoints
+      - name: 🧪 Test All Endpoints
         if: env.CLOUDFLARE_URL != ''
         run: |
-          echo "═══════════════════════════════════════════"
-          echo "1️⃣  /health"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/health" | jq '{status, model, model_loaded, active_endpoint, tools_count}'
-
+          BASE="${{ env.CLOUDFLARE_URL }}"
+          echo "═══════════════════════════════════════════════"
+          echo "Testing: $BASE"
           echo ""
-          echo "2️⃣  /v1/models (client model detection)"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/models" | jq '.data[].id'
 
+          echo "1️⃣  GET / (model discovery)"
+          curl -sf "$BASE/" | jq '{model: .model, active_endpoint: .active_endpoint}'
           echo ""
-          echo "3️⃣  /v1/tools (available tool names)"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/tools" | jq '.tools[].function.name'
 
+          echo "2️⃣  GET /health"
+          curl -sf "$BASE/health" | jq '{status, model_loaded, active_endpoint}'
           echo ""
-          echo "4️⃣  Smoke-test /v1/chat/completions (no stream)"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
+
+          echo "3️⃣  GET /v1/models (OpenAI model list)"
+          curl -sf "$BASE/v1/models" | jq '.data[].id'
+          echo ""
+
+          echo "4️⃣  GET /api/tags (Ollama model list)"
+          curl -sf "$BASE/api/tags" | jq '.models[].name'
+          echo ""
+
+          echo "5️⃣  GET /api/version (should be >= 0.1.16)"
+          curl -sf "$BASE/api/version" | jq .
+          echo ""
+
+          echo "6️⃣  POST /v1/chat/completions (OpenAI smoke test)"
+          curl -sf "$BASE/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"${{ env.MODEL }}\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: pong\"}],\"max_tokens\":16,\"stream\":false}" \
-            | jq '{id, model, finish_reason: .choices[0].finish_reason, content: .choices[0].message.content}'
-
+            -d "{
+              \"model\": \"${{ env.MODEL }}\",
+              \"messages\": [{\"role\":\"user\",\"content\":\"Reply with just: pong\"}],
+              \"max_tokens\": 10,
+              \"stream\": false
+            }" | jq '{finish_reason: .choices[0].finish_reason, content: .choices[0].message.content}'
           echo ""
+
+          echo "7️⃣  POST /api/chat (raw Ollama smoke test)"
+          curl -sf "$BASE/api/chat" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"${{ env.MODEL }}\",
+              \"messages\": [{\"role\":\"user\",\"content\":\"Reply with just: pong\"}],
+              \"stream\": false
+            }" | jq '{done, content: .message.content}'
+          echo ""
+
           echo "✅ All endpoint tests complete"
 
       - name: ⏱️ Session Pulser (${{ env.SESSION_HOURS }}h)
         run: |
           SESSION_SECONDS=$(( ${{ env.SESSION_HOURS }} * 3600 ))
-          echo "⏱️ Session running for ${SESSION_SECONDS} s..."
+          echo "⏱️ Session: ${SESSION_SECONDS}s"
           [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "🌐 ${{ env.CLOUDFLARE_URL }}"
 
-          START=$(date +%s)
-          END=$(( START + SESSION_SECONDS ))
+          START=$(date +%s); END=$(( START + SESSION_SECONDS ))
           while [ "$(date +%s)" -lt "$END" ]; do
             PCT=$(( ( ($(date +%s) - START) * 100 ) / SESSION_SECONDS ))
-            echo "⏰ $(date '+%H:%M:%S') | ${PCT}% elapsed"
-            # Keepalive ping
-            curl -sf --max-time 10 \
-              "${{ env.CLOUDFLARE_URL }}/health" 2>/dev/null \
-              | jq -r '"🏥 \(.status) | endpoint: \(.active_endpoint)"' 2>/dev/null || true
+            echo "⏰ $(date '+%H:%M:%S') | ${PCT}%"
+            curl -sf --max-time 10 "${{ env.CLOUDFLARE_URL }}/health" 2>/dev/null \
+              | jq -r '"🏥 \(.status) | \(.active_endpoint)"' 2>/dev/null || true
             sleep 300
           done
-          echo "🏁 Session complete"
+          echo "🏁 Done"
 
       - name: 📊 Final Report
         if: always()
         run: |
-          echo "══════════════ FINAL REPORT ══════════════"
-          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "🌐 Tunnel URL: ${{ env.CLOUDFLARE_URL }}"
-          echo ""
-          echo "── Proxy health ──"
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | jq . || echo "Proxy unreachable"
-          echo ""
-          echo "── Last 20 proxy log lines ──"
-          tail -20 proxy.log 2>/dev/null | sed 's/^/   /' || true
-          echo ""
-          echo "── Last 10 Ollama log lines ──"
-          tail -10 ollama.log 2>/dev/null | sed 's/^/   /' || true
+          echo "══════ FINAL REPORT ══════"
+          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "🌐 ${{ env.CLOUDFLARE_URL }}"
+          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | jq . || true
+          echo "── proxy.log (last 20) ──"
+          tail -20 proxy.log 2>/dev/null | sed 's/^/  /' || true
+          echo "── ollama.log (last 10) ──"
+          tail -10 ollama.log 2>/dev/null | sed 's/^/  /' || true
 
       - name: 🛑 Cleanup
         if: always()
         run: |
-          echo "🛑 Cleaning up..."
-          for pid_file in tunnel.pid proxy.pid ollama.pid; do
-            [ -f "$pid_file" ] && kill -9 "$(cat "$pid_file")" 2>/dev/null || true
+          for f in tunnel.pid proxy.pid ollama.pid; do
+            [ -f "$f" ] && kill -9 "$(cat $f)" 2>/dev/null || true
           done
           pkill -9 -f cloudflared 2>/dev/null || true
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp ${{ env.OLLAMA_PORT }}/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
-          echo "✅ Cleanup complete"
+          echo "✅ Cleanup done"
