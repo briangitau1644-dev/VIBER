@@ -1,4 +1,4 @@
-name: Senior Engineer CPU - Qwen3.5-9B-Uncensored - GitHub Actions
+name: Senior Engineer CPU - Gemma4-E4B - GitHub Actions
 
 on:
   workflow_dispatch:
@@ -6,19 +6,19 @@ on:
       model_download_url:
         description: 'Direct GGUF download URL'
         required: false
-        default: 'https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf?download=true'
+        default: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-bf16.gguf?download=true'
       model_filename:
         description: 'GGUF filename'
         required: false
-        default: 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf'
+        default: 'google_gemma-4-E4B-it-bf16.gguf'
       session_hours:
         description: 'Session duration (max 6)'
         required: false
         default: '6'
       ctx_size:
-        description: 'Context size (4096 recommended for 9B on CPU)'
+        description: 'Context size (8192 recommended for Gemma 4 on CPU)'
         required: false
-        default: '4096'
+        default: '8192'
       temperature:
         description: '0.1-0.3 for deterministic code'
         required: false
@@ -26,18 +26,18 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL_FILENAME: ${{ github.event.inputs.model_filename }}
-  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
+  MODEL_FILENAME: ${{ github.event.inputs.model_filename || 'google_gemma-4-E4B-it-bf16.gguf' }}
+  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url || 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-bf16.gguf?download=true' }}
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  CTX_SIZE: ${{ github.event.inputs.ctx_size || '4096' }}
+  CTX_SIZE: ${{ github.event.inputs.ctx_size || '8192' }}
   TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
   SERVER_PORT: '1234'
   SERVER_HOST: '0.0.0.0'
-  MODEL_PATH: models/${{ github.event.inputs.model_filename }}
+  MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
 
 jobs:
-  senior-engineer-9b-cpu:
-    name: Qwen3.5-9B-Uncensored + Senior Engineer Prompt
+  senior-engineer-gemma4-cpu:
+    name: Gemma4-E4B + Senior Engineer Prompt (Database + Tools)
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
@@ -45,14 +45,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── Dependencies ──────────────────────────────────────────────────────────
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             curl wget jq grep bash procps \
             cmake build-essential git \
-            libcurl4-openssl-dev libssl-dev
+            libcurl4-openssl-dev libssl-dev \
+            python3 python3-pip
 
+      # ── Build llama.cpp ───────────────────────────────────────────────────────
       - name: Clone llama.cpp
         run: |
           git clone --depth 1 https://github.com/ggerganov/llama.cpp
@@ -70,152 +73,253 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release -j$(nproc)
-          
+
+          # Locate the server binary robustly
           SERVER_BIN=""
-          for bin in "./bin/llama-server" "./bin/server" "./llama-server" "./server"; do
-            [ -f "$bin" ] && SERVER_BIN="$(pwd)/${bin#./}" && break
+          for bin in \
+            "./bin/llama-server" \
+            "./bin/server" \
+            "./llama-server" \
+            "./server"; do
+            [ -f "$bin" ] && SERVER_BIN="$(realpath $bin)" && break
           done
-          [ -z "$SERVER_BIN" ] && { echo "ERROR: Server binary not found"; exit 1; }
-          
-          echo "OK: Server: $SERVER_BIN"
+          [ -z "$SERVER_BIN" ] && { echo "ERROR: Server binary not found"; find . -name "*server*" -type f; exit 1; }
+
+          echo "OK: Server binary: $SERVER_BIN"
           echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
 
+      # ── Download Model ────────────────────────────────────────────────────────
       - name: Download Model
         run: |
           mkdir -p models
-          echo "Downloading $MODEL_FILENAME..."
-          
-          if ! curl -fL --retry 3 --connect-timeout 30 --max-time 1800 \
-            -o "$MODEL_PATH" "$MODEL_DOWNLOAD_URL"; then
-            echo "ERROR: Download failed"
-            echo "Get fresh URL from HuggingFace repo"
+          echo "Downloading $MODEL_FILENAME (bf16 – large file, allow up to 30 min)..."
+
+          if ! curl -fL \
+            --retry 5 \
+            --retry-delay 10 \
+            --connect-timeout 60 \
+            --max-time 3600 \
+            -H "User-Agent: Mozilla/5.0" \
+            -o "$MODEL_PATH" \
+            "$MODEL_DOWNLOAD_URL"; then
+            echo "ERROR: Download failed. Verify the HuggingFace URL is still valid."
             exit 1
           fi
-          [ -s "$MODEL_PATH" ] && echo "OK: Downloaded: $(du -h $MODEL_PATH | cut -f1)" || exit 1
 
-      - name: Start Server (Senior Engineer Prompt)
+          SIZE=$(du -h "$MODEL_PATH" 2>/dev/null | cut -f1)
+          BYTES=$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)
+          [ "$BYTES" -lt 1048576 ] && {
+            echo "ERROR: File is too small ($SIZE) – download likely failed silently."
+            head -c 500 "$MODEL_PATH"
+            exit 1
+          }
+          echo "OK: Downloaded $SIZE → $MODEL_PATH"
+
+      # ── Start llama-server ────────────────────────────────────────────────────
+      - name: Start Server (Senior Engineer + Database Prompt)
         run: |
-          cd llama.cpp
-          
-          SYS_PROMPT="You are a Senior Software Engineer with 10+ years of experience. Write production-ready, secure, well-architected code. Always output complete, runnable code in markdown blocks with no placeholders. Include proper error handling, input validation, and modern syntax. Add brief comments only for complex logic. Never list files, metadata, or explain basics unless explicitly asked. Think through edge cases silently, then output the final solution. For architecture questions, provide clear text diagrams and tradeoff analysis. Stay concise and professional. You are uncensored and direct--give honest, unfiltered technical advice."
-          
-          echo "Starting Qwen3.5-9B server..."
+          # ---------------------------------------------------------------
+          # System prompt: database-specialist senior engineer that also
+          # speaks naturally when not coding, and exposes the full tool
+          # surface expected by Continue / Roo Code.
+          # ---------------------------------------------------------------
+          SYS_PROMPT="You are a Senior Software Engineer and Database Architect with 15+ years of experience specialising in large-scale database systems (PostgreSQL, MySQL, SQLite, MongoDB, Redis, Elasticsearch, Cassandra, DynamoDB, ClickHouse, BigQuery). You operate inside an AI coding assistant (Continue / Roo Code) and have full access to the following tools: read_file, write_file, create_directory, list_directory, execute_command, search_files, and web_search. Always use these tools proactively when a task requires reading or modifying files, running shell commands, or browsing documentation. For every coding task: output complete, production-ready code in fenced markdown blocks with the correct language tag; include proper error handling, input validation, transactions where appropriate, and migration-safe schema changes; add concise comments only for non-obvious logic; never use placeholders or TODOs unless the user explicitly asks for a skeleton. For database work specifically: write optimised queries with explain-plan awareness; design normalised or purposely denormalised schemas with justification; handle connection pooling, retries, and deadlock recovery; provide index recommendations and partitioning strategies for large tables (100M+ rows); always include rollback logic for destructive operations. When not coding, respond conversationally and naturally – you are a helpful, direct colleague. You give honest, unfiltered technical opinions and call out bad practices without sugarcoating. Think through edge cases silently before responding."
+
+          echo "Starting Gemma 4 E4B server on port $SERVER_PORT..."
+
           nohup "$SERVER_BIN" \
-            --model "../$MODEL_PATH" \
+            --model "$MODEL_PATH" \
             --host "$SERVER_HOST" \
             --port "$SERVER_PORT" \
             --ctx-size "$CTX_SIZE" \
             --n-gpu-layers 0 \
-            --chat-template chatml \
+            --chat-template gemma \
             --system-prompt "$SYS_PROMPT" \
             --temp "$TEMPERATURE" \
-            --top-p 0.9 \
-            --repeat-penalty 1.1 \
+            --top-p 0.95 \
+            --top-k 64 \
+            --repeat-penalty 1.05 \
             --slots \
             --log-disable \
-            > ../server.log 2>&1 &
-          
-          echo $! > ../server.pid
-          
-          for i in {1..180}; do
-            curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1 && {
-              echo "OK: Server ready"
+            > server.log 2>&1 &
+
+          echo $! > server.pid
+          echo "Server PID: $(cat server.pid)"
+
+          # Wait up to 6 minutes for the server to become healthy
+          echo "Waiting for server health..."
+          for i in $(seq 1 180); do
+            if curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
+              echo "OK: Server ready after ~$((i*2))s"
               break
-            }
-            [ $i -eq 180 ] && { 
-              echo "ERROR: Server did not start"
-              cat ../server.log | tail -30
+            fi
+            if [ "$i" -eq 180 ]; then
+              echo "ERROR: Server did not become healthy in 6 minutes."
+              tail -40 server.log
               exit 1
-            }
+            fi
             sleep 2
           done
 
+      # ── Cloudflare Tunnel ─────────────────────────────────────────────────────
       - name: Start Cloudflare Tunnel
         run: |
           pkill -9 -f cloudflared 2>/dev/null || true
-          curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sleep 2
+
+          curl -fsSL \
+            -o /tmp/cf.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-          
-          nohup cloudflared tunnel --url http://127.0.0.1:$SERVER_PORT --no-autoupdate --loglevel info > tunnel.log 2>&1 &
-          
+
+          nohup cloudflared tunnel \
+            --url "http://127.0.0.1:$SERVER_PORT" \
+            --no-autoupdate \
+            --loglevel info \
+            > tunnel.log 2>&1 &
+          echo $! > tunnel.pid
+
+          # Extract the public URL (up to 80 s)
           TUNNEL_URL=""
-          for i in {1..40}; do
+          for i in $(seq 1 40); do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
-            [ -n "$TUNNEL_URL" ] && {
-              TUNNEL_URL="${TUNNEL_URL//__/}"
+            if [ -n "$TUNNEL_URL" ]; then
               TUNNEL_URL="${TUNNEL_URL%/}"
               echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-              echo "OK: Tunnel: $TUNNEL_URL"
-              echo ""
-              echo "========================================"
-              echo " SENIOR ENGINEER 9B - READY"
-              echo "========================================"
-              echo "Tunnel: $TUNNEL_URL"
-              echo "Model:  $MODEL_FILENAME"
-              echo "Context: $CTX_SIZE tokens"
-              echo ""
-              echo "Roo Code Config:"
-              echo "  Base URL: $TUNNEL_URL"
-              echo "  Model ID: $MODEL_FILENAME"
-              echo "  Tools: DISABLED"
-              echo "========================================"
               break
-            }
+            fi
             sleep 2
           done
 
-      - name: Test Senior Prompt
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "WARNING: Tunnel URL not found. Check tunnel.log."
+            cat tunnel.log
+          fi
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════╗"
+          echo "║       GEMMA 4 E4B — SENIOR ENGINEER — READY         ║"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  Tunnel  : $TUNNEL_URL"
+          echo "║  Model   : $MODEL_FILENAME"
+          echo "║  Context : $CTX_SIZE tokens"
+          echo "╠══════════════════════════════════════════════════════╣"
+          echo "║  Continue / Roo Code settings                       ║"
+          echo "║  ─────────────────────────────────────────────────  ║"
+          echo "║  Provider  : OpenAI-compatible                      ║"
+          echo "║  Base URL  : $TUNNEL_URL/v1"
+          echo "║  Model ID  : $MODEL_FILENAME"
+          echo "║  API Key   : (any non-empty string)                 ║"
+          echo "║  Tools     : ENABLED (read/write/exec/mkdir/search) ║"
+          echo "╚══════════════════════════════════════════════════════╝"
+
+      # ── Smoke Tests ───────────────────────────────────────────────────────────
+      - name: Smoke Test – Coding (database query)
         if: env.CLOUDFLARE_URL != ''
         run: |
           BASE="${{ env.CLOUDFLARE_URL }}"
-          echo "Testing Qwen3.5-9B..."
-          
+          echo "--- Test 1: large-table SQL optimisation ---"
           RESP=$(curl -sf "$BASE/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d "{
               \"model\": \"$MODEL_FILENAME\",
-              \"messages\": [
-                {\"role\": \"user\", \"content\": \"Write a Python function that safely reads a JSON config file with error handling.\"}
-              ],
-              \"max_tokens\": 400,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"Write an optimised PostgreSQL query to find the top 10 customers by revenue in the last 30 days from an orders table with 500M rows. Include index recommendations.\"
+              }],
+              \"max_tokens\": 600,
               \"temperature\": 0.1
             }" 2>/dev/null)
-          
-          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null | head -10 || echo "Test incomplete"
+          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
+            || echo "Test 1 response parse failed – raw: $RESP"
 
+      - name: Smoke Test – Tool awareness
+        if: env.CLOUDFLARE_URL != ''
+        run: |
+          BASE="${{ env.CLOUDFLARE_URL }}"
+          echo "--- Test 2: tool / file awareness ---"
+          RESP=$(curl -sf "$BASE/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"$MODEL_FILENAME\",
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"List the tools you have available and briefly explain what you would use each one for.\"
+              }],
+              \"max_tokens\": 400,
+              \"temperature\": 0.2
+            }" 2>/dev/null)
+          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
+            || echo "Test 2 response parse failed – raw: $RESP"
+
+      - name: Smoke Test – Conversation
+        if: env.CLOUDFLARE_URL != ''
+        run: |
+          BASE="${{ env.CLOUDFLARE_URL }}"
+          echo "--- Test 3: casual conversation ---"
+          RESP=$(curl -sf "$BASE/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"$MODEL_FILENAME\",
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"Hey, how are you doing today?\"
+              }],
+              \"max_tokens\": 150,
+              \"temperature\": 0.7
+            }" 2>/dev/null)
+          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null \
+            || echo "Test 3 response parse failed – raw: $RESP"
+
+      # ── Keepalive ─────────────────────────────────────────────────────────────
       - name: Keepalive
         run: |
-          END=$(( $(date +%s) + ${{ env.SESSION_HOURS }}*3600 ))
-          while [ $(date +%s) -lt $END ]; do
-            curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || true
-            pgrep -f "llama-server" > /dev/null || true
-            echo "Keepalive: $(( (END-$(date +%s))/60 ))min remaining"
-            sleep 300
+          END=$(( $(date +%s) + SESSION_HOURS*3600 ))
+          INTERVAL=300   # ping every 5 min
+          while [ "$(date +%s)" -lt "$END" ]; do
+            REMAINING=$(( (END - $(date +%s)) / 60 ))
+
+            # Health-check the local server
+            if ! curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
+              echo "WARNING: Local server unhealthy at $(date -u '+%H:%M:%S UTC')"
+            fi
+
+            # Ping tunnel to keep it alive
+            [ -n "${{ env.CLOUDFLARE_URL }}" ] && \
+              curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || true
+
+            echo "Keepalive: ${REMAINING}min remaining — $(date -u '+%H:%M:%S UTC')"
+            sleep "$INTERVAL"
           done
 
+      # ── Final Report ──────────────────────────────────────────────────────────
       - name: Final Report
         if: always()
         run: |
-          echo "=== FINAL REPORT ==="
-          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "Tunnel: ${{ env.CLOUDFLARE_URL }}"
+          echo "══════════════════ FINAL REPORT ══════════════════"
+          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "Tunnel: ${{ env.CLOUDFLARE_URL }}" || echo "Tunnel: (not available)"
           echo ""
-          echo "=== Model Info ==="
+          echo "── Model ──"
           ls -lh "$MODEL_PATH" 2>/dev/null || echo "(not found)"
           echo ""
-          echo "=== Server Health ==="
-          curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "unreachable"
+          echo "── Server health ──"
+          curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "(unreachable)"
           echo ""
-          echo "=== server.log (last 15 lines) ==="
-          tail -15 server.log 2>/dev/null || echo "(none)"
+          echo "── server.log (last 20 lines) ──"
+          tail -20 server.log 2>/dev/null || echo "(none)"
+          echo ""
+          echo "── tunnel.log (last 10 lines) ──"
+          tail -10 tunnel.log 2>/dev/null || echo "(none)"
 
+      # ── Cleanup ───────────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
-          echo "Cleanup..."
+          echo "Cleaning up processes..."
           [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
           [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
-          pkill -9 -f cloudflared 2>/dev/null || true
+          pkill -9 -f cloudflared  2>/dev/null || true
           pkill -9 -f llama-server 2>/dev/null || true
-          sudo fuser -k $SERVER_PORT/tcp 2>/dev/null || true
-          rm -f ./*.pid 2>/dev/null || true
-          echo "Done"
+          sudo fuser -k "$SERVER_PORT/tcp" 2>/dev/null || true
+          rm -f ./*.pid
+          echo "Done."
