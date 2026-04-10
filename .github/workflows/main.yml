@@ -74,30 +74,32 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           
-          # Build default targets (includes server) to avoid target name mismatches
+          # Build default targets (includes server)
           cmake --build . --config Release -j$(nproc)
           
-          # Find the server binary (location varies by llama.cpp version)
+          # Find the server binary and store its ABSOLUTE PATH
+          # This prevents "file not found" errors when changing directories later
           SERVER_BIN=""
-          if [ -f "./bin/server" ]; then
-            SERVER_BIN="./bin/server"
-          elif [ -f "./server" ]; then
-            SERVER_BIN="./server"
-          elif [ -f "./bin/llama-server" ]; then
-            SERVER_BIN="./bin/llama-server"
+          if [ -f "./bin/llama-server" ]; then
+            SERVER_BIN="$(pwd)/bin/llama-server"
+          elif [ -f "./bin/server" ]; then
+            SERVER_BIN="$(pwd)/bin/server"
           elif [ -f "./llama-server" ]; then
-            SERVER_BIN="./llama-server"
+            SERVER_BIN="$(pwd)/llama-server"
+          elif [ -f "./server" ]; then
+            SERVER_BIN="$(pwd)/server"
           fi
           
           if [ -z "$SERVER_BIN" ]; then
             echo "❌ Server binary not found after build"
-            echo "Searching for executable..."
             find .. -type f -executable -name "*server*" 2>/dev/null || echo "(none)"
             exit 1
           fi
           
           echo "✅ llama.cpp server built: $SERVER_BIN"
           $SERVER_BIN --help 2>&1 | head -15
+          
+          # Export the absolute path for use in other steps
           echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
 
       - name: 📥 Download Model (with Fallback Prompt)
@@ -164,12 +166,14 @@ jobs:
           cd llama.cpp
           
           echo "🚀 Starting llama.cpp server..."
-          echo "   Model: $MODEL_PATH"
+          echo "   Server Bin: $SERVER_BIN"
+          echo "   Model Path (relative): ../$MODEL_PATH"
           echo "   Port: $SERVER_PORT"
           echo "   Context: $CTX_SIZE tokens"
           echo "   GPU layers: $N_GPU_LAYERS"
           
-          nohup $SERVER_BIN \
+          # Use absolute SERVER_BIN path found in build step
+          nohup "$SERVER_BIN" \
             --model "../$MODEL_PATH" \
             --host "$SERVER_HOST" \
             --port "$SERVER_PORT" \
@@ -388,13 +392,14 @@ jobs:
             HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null || echo '{"status":"down"}')
             echo "🟢 Server local: $(echo "$HEALTH" | jq -r .status 2>/dev/null || echo unreachable)"
 
-            SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "./server" || pgrep -f "llama-server" || true)
+            SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "llama-server" || true)
             if [ -n "$SERVER_PIDS" ]; then
               echo "🦙 Server: alive (PIDs: $SERVER_PIDS)"
             else
               echo "❌ Server not found — restarting..."
-              cd llama.cpp
-              nohup $SERVER_BIN \
+              # No need to cd if using absolute paths, but safer to be in llama.cpp dir if it uses relative configs
+              cd llama.cpp || true
+              nohup "$SERVER_BIN" \
                 --model "../$MODEL_PATH" \
                 --host "$SERVER_HOST" \
                 --port "$SERVER_PORT" \
@@ -450,7 +455,6 @@ jobs:
           [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
           pkill -9 -f cloudflared 2>/dev/null || true
           pkill -9 -f "llama.cpp.*server" 2>/dev/null || true
-          pkill -9 -f "./server" 2>/dev/null || true
           pkill -9 -f "llama-server" 2>/dev/null || true
           sudo fuser -k $SERVER_PORT/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
