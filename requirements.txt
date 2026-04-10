@@ -1,0 +1,9 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+requests
+pydantic
+starlette
+psutil
+numpy
+# torch is installed separately with CPU index
