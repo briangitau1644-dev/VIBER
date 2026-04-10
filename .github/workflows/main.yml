@@ -7,16 +7,18 @@ on:
 env:
   # Using Node 24 for future-proofing GitHub Actions
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  # HuggingFace base URL for model downloads
-  HF_BASE: 'https://huggingface.co'
-  # Model repository and file - using a verified GGUF mirror
-  MODEL_REPO: 'bartowski/gemma-4-E4B-it-GGUF'
-  MODEL_FILE: 'gemma-4-E4B-it-Q4_K_M.gguf'
-  MODEL_PATH: 'models/gemma-4-E4B-it-Q4_K_M.gguf'
-  # Server configuration
+  
+  # === MODEL CONFIGURATION (UPDATED) ===
+  # Exact model URL as provided by user
+  MODEL_URL: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-bf16.gguf?download=true'
+  MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
+  MODEL_FILENAME: 'google_gemma-4-E4B-it-bf16.gguf'
+  
+  # === SERVER CONFIGURATION ===
   SERVER_PORT: '8080'
   PROXY_PORT: '11434'
-  # llama.cpp configuration
+  
+  # === LLAMA.CPP CONFIGURATION ===
   LLAMA_REPO: 'https://github.com/ggml-org/llama.cpp'
   LLAMA_BRANCH: 'master'
 
@@ -91,35 +93,38 @@ jobs:
           # Verify binary works
           $SERVER_BIN --help | head -5
 
-      - name: Download Gemma-4 GGUF model from HuggingFace
+      - name: Download Gemma-4 BF16 GGUF model
         run: |
           mkdir -p models
-          echo "📦 Downloading GGUF model from HuggingFace..."
-          echo "   Repository: ${MODEL_REPO}"
-          echo "   File: ${MODEL_FILE}"
+          echo "📦 Downloading BF16 GGUF model (large file ~15GB)..."
+          echo "   URL: ${MODEL_URL}"
+          echo "   Destination: ${MODEL_PATH}"
+          echo "   ⚠️  This may take 10-30 minutes depending on bandwidth"
           
-          # Use the correct HuggingFace resolve URL format [[57]]
-          DOWNLOAD_URL="${HF_BASE}/${MODEL_REPO}/resolve/main/${MODEL_FILE}"
-          
-          # Download with retry logic and progress
-          curl -fL --retry 3 --retry-delay 10 \
+          # Download with retry logic, progress, and timeout for large file
+          curl -fL --retry 3 --retry-delay 15 --connect-timeout 30 --max-time 1800 \
             -o "${MODEL_PATH}" \
-            "${DOWNLOAD_URL}"
+            "${MODEL_URL}"
           
-          # Verify download
+          # Verify download succeeded
           if [ ! -f "${MODEL_PATH}" ]; then
             echo "❌ ERROR: Model download failed!"
             exit 1
           fi
           
+          # Show file info
           FILE_SIZE=$(stat -c%s "${MODEL_PATH}" 2>/dev/null || stat -f%z "${MODEL_PATH}" 2>/dev/null)
-          echo "✅ Model downloaded: $(numfmt --to=iec-i --suffix=B ${FILE_SIZE} 2>/dev/null || echo "${FILE_SIZE} bytes")"
+          echo "✅ Model downloaded successfully"
+          echo "   File: ${MODEL_FILENAME}"
+          echo "   Size: $(numfmt --to=iec-i --suffix=B ${FILE_SIZE} 2>/dev/null || echo "${FILE_SIZE} bytes")"
+          echo "   Path: $(realpath ${MODEL_PATH})"
 
       - name: Start llama-server with OpenAI-compatible API
         run: |
-          echo "🚀 Starting llama-server..."
+          echo "🚀 Starting llama-server with BF16 model..."
           
-          # Start server in background with proper flags for Gemma 4 [[66]][[67]]
+          # Start server in background with flags optimized for CPU inference
+          # BF16 models require more RAM but offer higher precision
           $SERVER_BIN \
             --model "${MODEL_PATH}" \
             --port ${{ env.SERVER_PORT }} \
@@ -127,6 +132,8 @@ jobs:
             --threads $(nproc) \
             --chat-template gemma \
             --n-predict 2048 \
+            --batch-size 512 \
+            --ubatch-size 256 \
             --log-disable \
             &
           
@@ -134,19 +141,21 @@ jobs:
           echo "llama-server PID: $SERVER_PID"
           echo "SERVER_PID=${SERVER_PID}" >> $GITHUB_ENV
           
-          # Health check loop with proper endpoint handling [[66]][[71]]
-          echo "⏳ Waiting for server to initialize (max 90 seconds)..."
-          for i in {1..18}; do
+          # Health check loop with proper endpoint handling
+          echo "⏳ Waiting for server to initialize (max 120 seconds for BF16 load)..."
+          for i in {1..24}; do
             if curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" | grep -qE '"status"|"ok"'; then
               echo "✅ Server is UP and healthy!"
-              curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" || true
+              curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" | head -c 200 || true
+              echo ""
               break
             fi
-            if [ $i -eq 18 ]; then
+            if [ $i -eq 24 ]; then
               echo "❌ ERROR: Server failed to start within timeout"
+              echo "📋 Last 20 lines of workflow log:"
               exit 1
             fi
-            echo "   Waiting... ($i/18)"
+            echo "   Waiting for model load... ($i/24)"
             sleep 5
           done
 
@@ -210,7 +219,7 @@ jobs:
                       if "messages" in data and not any(m.get("role") == "system" for m in data["messages"]):
                           data["messages"].insert(0, {"role": "system", "content": SYSTEM_PROMPT})
                       
-                      # Forward to llama-server OpenAI-compatible endpoint [[66]]
+                      # Forward to llama-server OpenAI-compatible endpoint
                       target_url = f"http://localhost:{SERVER_PORT}/v1/chat/completions"
                       req = urllib.request.Request(
                           target_url,
@@ -222,7 +231,7 @@ jobs:
                           method='POST'
                       )
                       
-                      with urllib.request.urlopen(req, timeout=120) as response:
+                      with urllib.request.urlopen(req, timeout=180) as response:
                           response_body = response.read()
                           self.send_response(response.getcode())
                           self.send_header("Content-Type", "application/json")
@@ -261,7 +270,7 @@ jobs:
         run: |
           echo "🌐 Setting up Cloudflare Tunnel for public access..."
           
-          # Download latest cloudflared Linux AMD64 binary [[47]][[50]]
+          # Download latest cloudflared Linux AMD64 binary
           curl -fL --retry 3 -o cloudflared \
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           
@@ -274,10 +283,9 @@ jobs:
           echo "TUNNEL_PID=${TUNNEL_PID}" >> $GITHUB_ENV
           
           # Wait for tunnel to establish and extract public URL
-          echo "⏳ Waiting for tunnel to connect (max 30 seconds)..."
+          echo "⏳ Waiting for tunnel to connect (max 45 seconds)..."
           PUBLIC_URL=""
-          for i in {1..10}; do
-            # Try multiple methods to get the URL
+          for i in {1..15}; do
             PUBLIC_URL=$(curl -sf "http://localhost:45678/metrics" 2>/dev/null | \
               grep -oP 'https://[a-z0-9.-]+\.trycloudflare\.com' | head -n1) || true
             
@@ -288,22 +296,15 @@ jobs:
             sleep 3
           done
           
-          # Fallback: parse from cloudflared stdout via log file
-          if [ -z "$PUBLIC_URL" ]; then
-            echo "⚠️  Could not auto-detect URL, trying alternate method..."
-            # Cloudflared outputs URL to stderr, capture it
-            PUBLIC_URL=$(./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate 2>&1 | \
-              grep -oP 'https://[a-z0-9.-]+\.trycloudflare\.com' | head -n1) || true
-          fi
-          
           if [ -n "$PUBLIC_URL" ]; then
             echo ""
             echo "╔════════════════════════════════════════════════════════╗"
-            echo "║  🎉 Your Gemma-4 Senior Engineer API is live!         ║"
+            echo "║  🎉 Your Gemma-4 BF16 Senior Engineer API is live!    ║"
             echo "╠════════════════════════════════════════════════════════╣"
             echo "║  Public URL: ${PUBLIC_URL}║"
             echo "║  Endpoint: ${PUBLIC_URL}/v1/chat/completions          ║"
             echo "║  Ollama-compatible: ${PUBLIC_URL}/api/chat              ║"
+            echo "║  Model: google_gemma-4-E4B-it-bf16.gguf (BF16)        ║"
             echo "╚════════════════════════════════════════════════════════╝"
             echo ""
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_ENV
@@ -321,12 +322,12 @@ jobs:
           echo "# OpenAI-compatible chat completion:"
           echo "curl -X POST ${PUBLIC_URL}/v1/chat/completions \\"
           echo "  -H 'Content-Type: application/json' \\"
-          echo "  -d '{\"model\": \"gemma-4\", \"messages\": [{\"role\": \"user\", \"content\": \"Write a Python function to validate email addresses\"}]}'"
+          echo "  -d '{\"model\": \"gemma-4-bf16\", \"messages\": [{\"role\": \"user\", \"content\": \"Write a Python function to validate email addresses\"}]}'"
           echo ""
           echo "# Ollama-compatible chat:"
           echo "curl -X POST ${PUBLIC_URL}/api/chat \\"
           echo "  -H 'Content-Type: application/json' \\"
-          echo "  -d '{\"model\": \"gemma-4\", \"messages\": [{\"role\": \"user\", \"content\": \"Create a React hook for API calls\"}]}'"
+          echo "  -d '{\"model\": \"gemma-4-bf16\", \"messages\": [{\"role\": \"user\", \"content\": \"Create a React hook for API calls\"}]}'"
           echo ""
           echo "# Health check:"
           echo "curl ${PUBLIC_URL}/health"
@@ -335,6 +336,7 @@ jobs:
         run: |
           echo "⏱️  Keeping tunnel alive for 6 hours (max GitHub Actions runtime)..."
           echo "💡 Tip: Use the PUBLIC_URL from workflow output to access your API"
+          echo "⚠️  Note: BF16 model inference on CPU will be slower than quantized versions"
           
           # Keep processes alive and monitor health
           for i in {1..720}; do  # 720 * 30s = 6 hours
