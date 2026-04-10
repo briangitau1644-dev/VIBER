@@ -34,7 +34,7 @@ jobs:
           pkill -9 -f cloudflared 2>/dev/null || true
           sudo fuser -k ${{ env.SERVER_PORT }}/tcp 2>/dev/null || true
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp 2>/dev/null || true
-          rm -rf llama.cpp build models cloudflared proxy.py
+          rm -rf llama.cpp build models cloudflared proxy.py tunnel.log
 
       - name: Install system dependencies
         run: |
@@ -110,12 +110,10 @@ jobs:
           python3 - << 'PYEOF'
           proxy_code = '''#!/usr/bin/env python3
           import http.server, urllib.request, urllib.parse, json, os, sys
-          
           SERVER_PORT = os.environ.get('SERVER_PORT', '8080')
           PROXY_PORT = int(os.environ.get('PROXY_PORT', '11434'))
           BACKEND_URL = f"http://localhost:{SERVER_PORT}"
           SYSTEM_PROMPT = "You are a Senior Full-Stack Engineer with 15+ years of experience. Expert in Python, Django, FastAPI, React, TypeScript, Node.js, and System Design. Respond with complete, clean, production-ready code following best practices. Include proper error handling, type hints, and documentation. No explanations unless explicitly asked. No placeholders or TODOs."
-          
           class ProxyHandler(http.server.BaseHTTPRequestHandler):
               protocol_version = 'HTTP/1.1'
               def log_message(self, format, *args):
@@ -168,9 +166,8 @@ jobs:
                   try: code,_,hdrs = self._forward('HEAD', self.path); self.send_response(code)
                   except: self.send_response(500)
                   self.end_headers()
-          
           if __name__ == "__main__":
-              print(f"🔗 Proxy: 0.0.0.0:{PROXY_PORT} -> {BACKEND_URL}")
+              print(f"🔗 Proxy: 0.0.0.0:{PROXY_PORT} -> {BACKEND_URL}", flush=True)
               http.server.HTTPServer(('0.0.0.0', PROXY_PORT), ProxyHandler).serve_forever()
           '''
           with open('proxy.py', 'w') as f: f.write(proxy_code)
@@ -181,45 +178,138 @@ jobs:
           sleep 3
           echo "✅ Proxy started"
 
-      - name: Download and start cloudflared tunnel
+      - name: Download and start cloudflared tunnel (FIXED URL detection)
         run: |
           echo "🌐 Setting up Cloudflare Tunnel..."
-          curl -fL --retry 3 -o cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+          
+          # Download cloudflared
+          curl -fL --retry 3 -s -o cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           chmod +x cloudflared
+          echo "✅ Cloudflared downloaded"
+          
+          # Start tunnel - capture BOTH stdout and stderr to file
+          echo "🔌 Starting tunnel to port ${{ env.PROXY_PORT }}..."
           ./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate > tunnel.log 2>&1 &
-          echo "TUNNEL_PID=$!" >> $GITHUB_ENV
-          echo "⏳ Waiting for tunnel..."
+          TUNNEL_PID=$!
+          echo "TUNNEL_PID=${TUNNEL_PID}" >> $GITHUB_ENV
+          echo "📋 Tunnel PID: $TUNNEL_PID"
+          
+          # Wait for tunnel to establish with robust URL extraction
+          echo "⏳ Waiting for tunnel URL (max 45 seconds)..."
           PUBLIC_URL=""
-          for i in {1..20}; do
-            [ -f tunnel.log ] && PUBLIC_URL=$(grep -oP 'https://[a-z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n1) && break
-            sleep 2
+          
+          for i in {1..15}; do
+            # Method 1: Parse from log file with flexible regex
+            if [ -f tunnel.log ]; then
+              # Try multiple patterns for trycloudflare.com URLs
+              PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n1) || true
+              
+              # Fallback: look for "Your quick Tunnel has been created" message
+              if [ -z "$PUBLIC_URL" ]; then
+                PUBLIC_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | tail -n1) || true
+              fi
+            fi
+            
+            # Method 2: Query cloudflared metrics endpoint
+            if [ -z "$PUBLIC_URL" ]; then
+              PUBLIC_URL=$(curl -sf "http://localhost:45678/metrics" 2>/dev/null | \
+                grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' | head -n1) || true
+            fi
+            
+            # Method 3: Check if tunnel is listening (fallback confirmation)
+            if [ -n "$PUBLIC_URL" ]; then
+              # Verify URL is actually working
+              if curl -sf --max-time 5 "$PUBLIC_URL/health" >/dev/null 2>&1; then
+                echo "✅ Verified tunnel URL is responding"
+                break
+              fi
+            fi
+            
+            [ $i -lt 15 ] && echo "   Waiting... ($i/15)" && sleep 3
           done
+          
+          # Final fallback: parse the last URL-like string from logs
+          if [ -z "$PUBLIC_URL" ] && [ -f tunnel.log ]; then
+            echo "🔍 Trying fallback URL extraction..."
+            PUBLIC_URL=$(grep -oE 'https?://[^[:space:]"<>]+' tunnel.log | \
+              grep trycloudflare | tail -n1 | tr -d '\r') || true
+          fi
+          
+          # Display results
           if [ -n "$PUBLIC_URL" ]; then
-            echo ""; echo "╔════════════════════════════════════════╗"
-            echo "║  🎉 Gemma-4 Q4_K_M API is live!              ║"
+            echo ""
+            echo "╔════════════════════════════════════════╗"
+            echo "║  🎉 Gemma-4 Q4_K_M API is LIVE!       ║"
             echo "╠════════════════════════════════════════╣"
-            echo "║  URL: ${PUBLIC_URL}║"
-            echo "║  Chat: ${PUBLIC_URL}/v1/chat/completions    ║"
-            echo "║  Ollama: ${PUBLIC_URL}/api/chat             ║"
-            echo "╚════════════════════════════════════════╝"; echo ""
+            echo "║  🔗 ${PUBLIC_URL}║"
+            echo "║  💬 Chat: ${PUBLIC_URL}/v1/chat/completions║"
+            echo "║  🤖 Ollama: ${PUBLIC_URL}/api/chat     ║"
+            echo "║  ✅ Health: ${PUBLIC_URL}/health       ║"
+            echo "╚════════════════════════════════════════╝"
+            echo ""
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_ENV
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_STEP_SUMMARY
+            
+            # Also output as GitHub Actions notice for visibility
+            echo "::notice::Your API is available at: ${PUBLIC_URL}"
           else
-            echo "⚠️  Could not detect URL - check tunnel.log"
-            cat tunnel.log 2>/dev/null || true
+            echo "⚠️  Could not auto-detect tunnel URL"
+            echo "📋 Last 30 lines of tunnel.log:"
+            tail -30 tunnel.log 2>/dev/null || echo "(no log file)"
+            echo ""
+            echo "🔧 Manual recovery: Check workflow logs for 'trycloudflare.com'"
+            echo "   Or re-run the workflow - quick tunnels are ephemeral"
           fi
+          
+          # Show tunnel status for debugging
+          echo ""
+          echo "📊 Tunnel diagnostics:"
+          echo "   PID: $TUNNEL_PID"
+          echo "   Process running: $(ps -p $TUNNEL_PID >/dev/null 2>&1 && echo 'YES' || echo 'NO')"
+          echo "   Log file size: $(wc -c < tunnel.log 2>/dev/null || echo 0) bytes"
 
       - name: Display usage examples
         if: env.PUBLIC_URL
         run: |
           echo "📋 Test your API:"
-          echo "# Health: curl ${PUBLIC_URL}/health"
-          echo "# Chat: curl -X POST ${PUBLIC_URL}/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"gemma-4-q4km\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python email validator\"}]}'"
+          echo ""
+          echo "# ✅ Health check:"
+          echo "curl -s ${PUBLIC_URL}/health | jq ."
+          echo ""
+          echo "# 💬 Code generation (OpenAI format):"
+          echo "curl -s -X POST ${PUBLIC_URL}/v1/chat/completions \\"
+          echo "  -H 'Content-Type: application/json' \\"
+          echo "  -d '{\"model\":\"gemma-4-q4km\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function to validate email addresses\"}],\"temperature\":0.2}' | jq -r '.choices[0].message.content'"
+          echo ""
+          echo "# 🤖 Ollama-compatible:"
+          echo "curl -s -X POST ${PUBLIC_URL}/api/chat \\"
+          echo "  -H 'Content-Type: application/json' \\"
+          echo "  -d '{\"model\":\"gemma-4-q4km\",\"messages\":[{\"role\":\"user\",\"content\":\"Create a React useForm hook\"}]}' | jq -r '.message.content'"
 
-      - name: Keep workflow alive
+      - name: Keep workflow alive and monitor tunnel
         run: |
-          echo "⏱️  Keeping tunnel alive (6 hours)..."
+          echo "⏱️  Keeping tunnel alive for 6 hours..."
+          echo "💡 Your API URL: ${PUBLIC_URL:-'Not detected - check previous step'}"
+          
           for i in {1..720}; do
-            curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" >/dev/null 2>&1 || echo "⚠️  Health check failed at $i"
+            # Check backend health
+            if ! curl -sf --max-time 10 "http://localhost:${{ env.SERVER_PORT }}/health" >/dev/null 2>&1; then
+              echo "⚠️  [$(date +%H:%M:%S)] Backend health check failed (iteration $i)"
+            fi
+            
+            # Check tunnel process
+            if ! ps -p ${TUNNEL_PID:-0} >/dev/null 2>&1; then
+              echo "⚠️  [$(date +%H:%M:%S)] Tunnel process died, attempting restart..."
+              ./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate > tunnel.log 2>&1 &
+              TUNNEL_PID=$!
+              echo "TUNNEL_PID=${TUNNEL_PID}" >> $GITHUB_ENV
+              sleep 10
+            fi
+            
+            # Print status every 60 iterations (~30 minutes)
+            [ $((i % 60)) -eq 0 ] && echo "✅ Alive check $i/720 - tunnel: $(ps -p ${TUNNEL_PID:-0} >/dev/null 2>&1 && echo UP || echo DOWN)"
+            
             sleep 30
           done
+          echo "✅ Workflow session completed successfully"
