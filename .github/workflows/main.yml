@@ -16,7 +16,7 @@ on:
         required: false
         default: '6'
       ctx_size:
-        description: 'Context size (8192 recommended for Gemma 4 on CPU)'
+        description: 'Context size'
         required: false
         default: '8192'
       temperature:
@@ -31,15 +31,13 @@ env:
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
   CTX_SIZE: ${{ github.event.inputs.ctx_size || '8192' }}
   TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
-  # Proxy port — what Continue / Roo Code connect to via the tunnel
   SERVER_PORT: '1234'
-  # Internal llama-server port — not exposed externally
   BACKEND_PORT: '11434'
   MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
 
 jobs:
   senior-engineer-gemma4-cpu:
-    name: Gemma4-E4B + Full-Stack Senior Engineer
+    name: Gemma4-E4B Full-Stack Senior Engineer
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
@@ -47,7 +45,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Dependencies ──────────────────────────────────────────────────────────
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
@@ -57,12 +54,10 @@ jobs:
             libcurl4-openssl-dev libssl-dev \
             python3
 
-      # ── Build llama.cpp ───────────────────────────────────────────────────────
       - name: Clone llama.cpp
         run: |
           git clone --depth 1 https://github.com/ggerganov/llama.cpp
-          cd llama.cpp
-          git log -1 --oneline
+          cd llama.cpp && git log -1 --oneline
 
       - name: Build llama-server
         run: |
@@ -75,7 +70,6 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build . --config Release -j$(nproc)
-
           SERVER_BIN=""
           for bin in "./bin/llama-server" "./bin/server" "./llama-server" "./server"; do
             [ -f "$bin" ] && SERVER_BIN="$(realpath $bin)" && break
@@ -88,11 +82,10 @@ jobs:
           echo "OK: $SERVER_BIN"
           echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
 
-      # ── Download Model ────────────────────────────────────────────────────────
       - name: Download Model
         run: |
           mkdir -p models
-          echo "Downloading $MODEL_FILENAME (bf16 = ~15 GB, allow up to 30 min)..."
+          echo "Downloading $MODEL_FILENAME (~15 GB bf16, allow up to 30 min)..."
           if ! curl -fL \
               --retry 5 --retry-delay 10 \
               --connect-timeout 60 --max-time 3600 \
@@ -104,108 +97,109 @@ jobs:
           fi
           BYTES=$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)
           if [ "$BYTES" -lt 1048576 ]; then
-            echo "ERROR: File too small — likely an HTML error page."
+            echo "ERROR: File too small - likely an HTML error page."
             head -c 500 "$MODEL_PATH"
             exit 1
           fi
           echo "OK: $(du -h $MODEL_PATH | cut -f1) saved to $MODEL_PATH"
 
-      # ── Write system-prompt + proxy ───────────────────────────────────────────
-      # NOTE: --system-prompt was removed from recent llama.cpp builds.
-      # A thin Python proxy on :1234 injects the system message into every
-      # /v1/chat/completions call before forwarding to llama-server on :11434.
       - name: Write System-Prompt Proxy
         run: |
-          cat > /tmp/sysprompt.txt << 'SYSPROMPT'
-You are a Senior Software Developer with 15+ years of experience across the full stack and every major programming language: Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, Ruby, Bash, SQL, GraphQL, and more. You are equally comfortable building frontends (React, Vue, Svelte, HTML/CSS), backends (REST APIs, gRPC, microservices, serverless), mobile apps, CLI tools, DevOps pipelines, databases (PostgreSQL, MySQL, SQLite, MongoDB, Redis, Cassandra), cloud infrastructure (AWS, GCP, Azure), and low-level systems code. You live inside a coding assistant (Continue or Roo Code) and have direct access to these tools: read_file, write_file, create_directory, list_directory, execute_command, search_files, and web_search. Use them proactively without being asked whenever a task involves files, folders, shell commands, or looking something up. When the user wants to chat, plan, brainstorm, or just think out loud, drop engineer mode and respond like a normal human being, naturally and conversationally, like a smart colleague sitting right next to them. When coding: always write complete production-ready code in fenced markdown blocks with the correct language tag; include error handling and input validation; never use placeholders or TODOs unless explicitly asked for a skeleton; add comments only where the logic is genuinely non-obvious. Give honest, direct opinions. Call out bad approaches and suggest better ones without sugarcoating. Adapt your communication style to whatever the user needs in the moment: casual chat, technical deep-dive, quick answer, or pair-programming session.
-SYSPROMPT
+          python3 - << 'EOF'
+          import textwrap, pathlib
 
-          cat > /tmp/proxy.py << 'PYPROXY'
-#!/usr/bin/env python3
-"""
-Proxy: public :1234 -> llama-server :11434
-Injects the system message into every /v1/chat/completions request.
-All other paths are forwarded unchanged.
-"""
-import http.server
-import urllib.request
-import urllib.error
-import json
-import os
+          # ── system prompt ────────────────────────────────────────────────────
+          prompt = (
+              "You are a Senior Software Developer with 15+ years of experience "
+              "across the full stack and every major programming language: Python, "
+              "JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, "
+              "Ruby, Bash, SQL, GraphQL, and more. You are equally comfortable "
+              "building frontends (React, Vue, Svelte, HTML/CSS), backends (REST APIs, "
+              "gRPC, microservices, serverless), mobile apps, CLI tools, DevOps "
+              "pipelines, databases (PostgreSQL, MySQL, SQLite, MongoDB, Redis, "
+              "Cassandra), cloud infrastructure (AWS, GCP, Azure), and low-level "
+              "systems code. You live inside a coding assistant (Continue or Roo Code) "
+              "and have direct access to these tools: read_file, write_file, "
+              "create_directory, list_directory, execute_command, search_files, and "
+              "web_search. Use them proactively without being asked whenever a task "
+              "involves files, folders, shell commands, or looking something up. When "
+              "the user wants to chat, plan, brainstorm, or just think out loud, drop "
+              "engineer mode and respond like a normal human being, naturally and "
+              "conversationally, like a smart colleague sitting right next to them. "
+              "When coding: always write complete production-ready code in fenced "
+              "markdown blocks with the correct language tag; include error handling "
+              "and input validation; never use placeholders or TODOs unless explicitly "
+              "asked for a skeleton; add comments only where the logic is genuinely "
+              "non-obvious. Give honest, direct opinions. Call out bad approaches and "
+              "suggest better ones without sugarcoating. Adapt your communication "
+              "style to whatever the user needs in the moment: casual chat, technical "
+              "deep-dive, quick answer, or pair-programming session."
+          )
+          pathlib.Path("/tmp/sysprompt.txt").write_text(prompt)
 
-BACKEND = "http://127.0.0.1:11434"
+          # ── proxy script ─────────────────────────────────────────────────────
+          proxy = textwrap.dedent('''
+              #!/usr/bin/env python3
+              """Proxy: public :1234 -> llama-server :11434
+              Injects system message into every /v1/chat/completions call."""
+              import http.server, urllib.request, urllib.error, json, os
 
-with open("/tmp/sysprompt.txt") as fh:
-    SYSTEM_PROMPT = fh.read().strip()
+              BACKEND = "http://127.0.0.1:11434"
+              SYSTEM_PROMPT = open("/tmp/sysprompt.txt").read().strip()
 
+              class Proxy(http.server.BaseHTTPRequestHandler):
+                  def log_message(self, *a): pass
 
-class Proxy(http.server.BaseHTTPRequestHandler):
-    def log_message(self, *args):
-        pass  # silence per-request noise
+                  def _forward(self, body=None):
+                      url = BACKEND + self.path
+                      hdrs = {k: v for k, v in self.headers.items()
+                              if k.lower() not in ("host", "content-length")}
+                      if body is not None:
+                          hdrs["Content-Length"] = str(len(body))
+                      req = urllib.request.Request(url, data=body, headers=hdrs, method=self.command)
+                      try:
+                          r = urllib.request.urlopen(req, timeout=600)
+                          st, rh, rb = r.status, r.headers, r.read()
+                      except urllib.error.HTTPError as e:
+                          st, rh, rb = e.code, e.headers, e.read()
+                      self.send_response(st)
+                      for k, v in rh.items():
+                          if k.lower() != "transfer-encoding":
+                              self.send_header(k, v)
+                      self.end_headers()
+                      self.wfile.write(rb)
 
-    def _forward(self, body=None):
-        url = BACKEND + self.path
-        headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in ("host", "content-length")
-        }
-        if body is not None:
-            headers["Content-Length"] = str(len(body))
-        req = urllib.request.Request(
-            url, data=body, headers=headers, method=self.command
-        )
-        try:
-            resp = urllib.request.urlopen(req, timeout=600)
-            status = resp.status
-            resp_headers = resp.headers
-            resp_body = resp.read()
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            resp_headers = exc.headers
-            resp_body = exc.read()
+                  def do_GET(self):    self._forward()
+                  def do_DELETE(self): self._forward()
 
-        self.send_response(status)
-        for k, v in resp_headers.items():
-            if k.lower() not in ("transfer-encoding",):
-                self.send_header(k, v)
-        self.end_headers()
-        self.wfile.write(resp_body)
+                  def do_POST(self):
+                      n = int(self.headers.get("Content-Length", 0))
+                      raw = self.rfile.read(n)
+                      if self.path.rstrip("/") == "/v1/chat/completions":
+                          try:
+                              p = json.loads(raw)
+                              msgs = p.get("messages", [])
+                              if not msgs or msgs[0].get("role") != "system":
+                                  msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                                  p["messages"] = msgs
+                              raw = json.dumps(p).encode()
+                          except Exception:
+                              pass
+                      self._forward(raw)
 
-    def do_GET(self):
-        self._forward()
+              if __name__ == "__main__":
+                  port = int(os.environ.get("PROXY_PORT", 1234))
+                  srv = http.server.HTTPServer(("0.0.0.0", port), Proxy)
+                  print(f"Proxy :{port} -> {BACKEND}", flush=True)
+                  srv.serve_forever()
+          ''').lstrip()
+          pathlib.Path("/tmp/proxy.py").write_text(proxy)
+          print("OK: sysprompt.txt and proxy.py written.")
+          EOF
 
-    def do_DELETE(self):
-        self._forward()
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-        if self.path.rstrip("/") == "/v1/chat/completions":
-            try:
-                payload = json.loads(raw)
-                msgs = payload.get("messages", [])
-                if not msgs or msgs[0].get("role") != "system":
-                    msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
-                    payload["messages"] = msgs
-                raw = json.dumps(payload).encode()
-            except Exception:
-                pass  # malformed JSON — forward as-is
-        self._forward(raw)
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PROXY_PORT", 1234))
-    server = http.server.HTTPServer(("0.0.0.0", port), Proxy)
-    print(f"Proxy on :{port} -> {BACKEND}", flush=True)
-    server.serve_forever()
-PYPROXY
-          echo "OK: sysprompt.txt and proxy.py written."
-
-      # ── Start llama-server (internal) ─────────────────────────────────────────
       - name: Start llama-server
         run: |
           echo "Starting llama-server on internal port $BACKEND_PORT..."
-
           nohup "$SERVER_BIN" \
             --model "$MODEL_PATH" \
             --host "127.0.0.1" \
@@ -220,15 +214,13 @@ PYPROXY
             --slots \
             --log-disable \
             2>&1 | grep -v "^warning:" > server.log &
-
           echo $! > server.pid
-          echo "llama-server PID: $(cat server.pid)"
+          echo "PID: $(cat server.pid)"
 
-          # bf16 15 GB model can take 5-8 min to mmap — wait up to 10 min
-          echo "Waiting for llama-server to load (up to 10 min)..."
+          echo "Waiting for llama-server to load (up to 10 min for 15 GB bf16)..."
           for i in $(seq 1 300); do
             if curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1; then
-              echo "OK: llama-server ready after ~$((i*2))s"
+              echo "OK: Ready after ~$((i*2))s"
               break
             fi
             if [ "$i" -eq 300 ]; then
@@ -239,14 +231,12 @@ PYPROXY
             sleep 2
           done
 
-      # ── Start proxy (public) ──────────────────────────────────────────────────
       - name: Start Proxy
         run: |
           echo "Starting system-prompt proxy on port $SERVER_PORT..."
           PROXY_PORT=$SERVER_PORT nohup python3 /tmp/proxy.py > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 3
-
           if curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
             echo "OK: Proxy healthy on :$SERVER_PORT"
           else
@@ -255,17 +245,14 @@ PYPROXY
             exit 1
           fi
 
-      # ── Cloudflare Tunnel ─────────────────────────────────────────────────────
       - name: Start Cloudflare Tunnel
         run: |
           pkill -9 -f cloudflared 2>/dev/null || true
           sleep 2
-
           curl -fsSL \
             -o /tmp/cf.deb \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-
           nohup cloudflared tunnel \
             --url "http://127.0.0.1:$SERVER_PORT" \
             --no-autoupdate \
@@ -285,39 +272,32 @@ PYPROXY
           done
 
           if [ -z "$TUNNEL_URL" ]; then
-            echo "WARNING: Tunnel URL not found. Check tunnel.log."
+            echo "WARNING: Tunnel URL not found."
             cat tunnel.log
           fi
 
-          echo ""
-          echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║         GEMMA 4 E4B — SENIOR ENGINEER — READY           ║"
-          echo "╠══════════════════════════════════════════════════════════╣"
-          echo "  Tunnel  : $TUNNEL_URL"
-          echo "  Model   : $MODEL_FILENAME"
-          echo "  Context : $CTX_SIZE tokens"
-          echo "╠══════════════════════════════════════════════════════════╣"
-          echo "  Continue / Roo Code settings:"
-          echo "    Provider  : OpenAI-compatible"
-          echo "    Base URL  : ${TUNNEL_URL}/v1"
-          echo "    Model ID  : $MODEL_FILENAME"
-          echo "    API Key   : any non-empty string"
-          echo "╚══════════════════════════════════════════════════════════╝"
+          echo "=================================================="
+          echo " GEMMA 4 E4B - SENIOR ENGINEER - READY"
+          echo "=================================================="
+          echo " Tunnel   : $TUNNEL_URL"
+          echo " Model    : $MODEL_FILENAME"
+          echo " Context  : $CTX_SIZE tokens"
+          echo "--------------------------------------------------"
+          echo " Continue / Roo Code settings"
+          echo "   Provider : OpenAI-compatible"
+          echo "   Base URL : ${TUNNEL_URL}/v1"
+          echo "   Model ID : $MODEL_FILENAME"
+          echo "   API Key  : any non-empty string"
+          echo "=================================================="
 
-      # ── Smoke Tests ───────────────────────────────────────────────────────────
       - name: Smoke Test - Code
         if: env.CLOUDFLARE_URL != ''
         run: |
           echo "--- Test 1: Python function ---"
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d '{
-              "model": "'"$MODEL_FILENAME"'",
-              "messages": [{"role":"user","content":"Write a Python function that reads a JSON file safely with full error handling."}],
-              "max_tokens": 400,
-              "temperature": 0.1
-            }' 2>/dev/null \
-            | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
+            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function that reads a JSON file safely with full error handling.\"}],\"max_tokens\":400,\"temperature\":0.1}" \
+            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
             || echo "Test 1 parse failed"
 
       - name: Smoke Test - Tools
@@ -326,13 +306,8 @@ PYPROXY
           echo "--- Test 2: tool awareness ---"
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d '{
-              "model": "'"$MODEL_FILENAME"'",
-              "messages": [{"role":"user","content":"What tools do you have available and what would you use each one for?"}],
-              "max_tokens": 350,
-              "temperature": 0.2
-            }' 2>/dev/null \
-            | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
+            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"What tools do you have available and what would you use each one for?\"}],\"max_tokens\":350,\"temperature\":0.2}" \
+            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
             || echo "Test 2 parse failed"
 
       - name: Smoke Test - Conversation
@@ -341,63 +316,43 @@ PYPROXY
           echo "--- Test 3: casual chat ---"
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d '{
-              "model": "'"$MODEL_FILENAME"'",
-              "messages": [{"role":"user","content":"Hey, how are you doing today?"}],
-              "max_tokens": 150,
-              "temperature": 0.7
-            }' 2>/dev/null \
-            | jq -r '.choices[0].message.content' 2>/dev/null \
+            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Hey, how are you doing today?\"}],\"max_tokens\":150,\"temperature\":0.7}" \
+            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
             || echo "Test 3 parse failed"
 
-      # ── Keepalive ─────────────────────────────────────────────────────────────
       - name: Keepalive
         run: |
           END=$(( $(date +%s) + $SESSION_HOURS * 3600 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             REMAINING=$(( (END - $(date +%s)) / 60 ))
-            curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1 \
-              || echo "WARNING: llama-server unhealthy"
-            curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1 \
-              || echo "WARNING: proxy unhealthy"
-            [ -n "${{ env.CLOUDFLARE_URL }}" ] && \
-              curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || true
-            echo "Keepalive: ${REMAINING}min remaining — $(date -u '+%H:%M:%S UTC')"
+            curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1 || echo "WARNING: llama-server unhealthy"
+            curl -sf "http://127.0.0.1:$SERVER_PORT/health"  > /dev/null 2>&1 || echo "WARNING: proxy unhealthy"
+            [ -n "${{ env.CLOUDFLARE_URL }}" ] && curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || true
+            echo "Keepalive: ${REMAINING}min remaining - $(date -u '+%H:%M:%S UTC')"
             sleep 300
           done
 
-      # ── Final Report ──────────────────────────────────────────────────────────
       - name: Final Report
         if: always()
         run: |
-          echo "══════════════════ FINAL REPORT ══════════════════"
-          [ -n "${{ env.CLOUDFLARE_URL }}" ] \
-            && echo "Tunnel: ${{ env.CLOUDFLARE_URL }}" \
-            || echo "Tunnel: (not available)"
-          echo ""
-          echo "── Model ──"
+          echo "========== FINAL REPORT =========="
+          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "Tunnel: ${{ env.CLOUDFLARE_URL }}" || echo "Tunnel: (not available)"
+          echo "--- Model ---"
           ls -lh "$MODEL_PATH" 2>/dev/null || echo "(not found)"
-          echo ""
-          echo "── llama-server health ──"
+          echo "--- llama-server health ---"
           curl -sf "http://127.0.0.1:$BACKEND_PORT/health" 2>/dev/null | jq . || echo "(unreachable)"
-          echo ""
-          echo "── proxy health ──"
+          echo "--- proxy health ---"
           curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "(unreachable)"
-          echo ""
-          echo "── server.log (last 20) ──"
+          echo "--- server.log (last 20) ---"
           tail -20 server.log 2>/dev/null || echo "(none)"
-          echo ""
-          echo "── proxy.log (last 10) ──"
+          echo "--- proxy.log (last 10) ---"
           tail -10 proxy.log 2>/dev/null || echo "(none)"
-          echo ""
-          echo "── tunnel.log (last 10) ──"
+          echo "--- tunnel.log (last 10) ---"
           tail -10 tunnel.log 2>/dev/null || echo "(none)"
 
-      # ── Cleanup ───────────────────────────────────────────────────────────────
       - name: Cleanup
         if: always()
         run: |
-          echo "Cleaning up..."
           [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
           [ -f proxy.pid  ] && kill -9 "$(cat proxy.pid)"  2>/dev/null || true
           [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
