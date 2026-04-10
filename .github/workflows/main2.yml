@@ -1,4 +1,4 @@
-name: Senior Engineer - Ollama Gemma4 E4B - GitHub Actions
+name: Senior Engineer - Ollama Gemma4 E4B
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  CTX_SIZE:      ${{ github.event.inputs.ctx_size    || '8192' }}
+  CTX_SIZE:      ${{ github.event.inputs.ctx_size || '8192' }}
   TEMPERATURE:   ${{ github.event.inputs.temperature || '0.2' }}
   OLLAMA_PORT:   '11434'
   PROXY_PORT:    '1234'
@@ -43,7 +43,7 @@ jobs:
           sudo fuser -k $PROXY_PORT/tcp  2>/dev/null || true
           sudo fuser -k $OLLAMA_PORT/tcp 2>/dev/null || true
           sleep 2
-          echo "Ports $PROXY_PORT and $OLLAMA_PORT are free."
+          echo "Ports clear."
 
       - name: Install system deps
         run: |
@@ -78,247 +78,6 @@ jobs:
           echo "Pull complete."
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
 
-      - name: Write tool-call interceptor proxy
-        run: |
-          python3 << 'PYEOF'
-import pathlib
-
-code = r'''
-import http.server, json, os, re, uuid, urllib.request, urllib.error, traceback
-
-BACKEND = "http://127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
-PORT    = int(os.environ.get("PROXY_PORT", "1234"))
-MODEL   = os.environ.get("MODEL", "gemma4:e4b")
-
-SYSTEM_PROMPT = """You are a Senior Software Developer with 15 years of full-stack experience.
-Languages: Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, Ruby, Bash, SQL, GraphQL.
-Frontends: React, Vue, Svelte, HTML/CSS/Tailwind.
-Backends: REST, gRPC, microservices, serverless, message queues.
-Databases: PostgreSQL, MySQL, SQLite, MongoDB, Redis, Cassandra, Elasticsearch.
-Cloud: AWS, GCP, Azure. Containers: Docker, Kubernetes.
-You are running inside Roo Code (VS Code extension). You have access to tools.
-
-TOOL CALL PROTOCOL
-When you need to use a tool, output ONLY a JSON function call in this exact format:
-{"tool_use": {"name": "<tool_name>", "parameters": {<key-value pairs>}}}
-
-Available tools:
-  read_file         : {"path": "<path>"}
-  write_file        : {"path": "<path>", "content": "<full file content>"}
-  create_directory  : {"path": "<dir path>"}
-  list_directory    : {"path": "<dir path>"}
-  execute_command   : {"command": "<shell command>", "cwd": "<optional working dir>"}
-  search_files      : {"pattern": "<glob or regex>", "path": "<root dir>"}
-  web_search        : {"query": "<search query>"}
-  browser_action    : {"action": "launch|click|type|screenshot|close", "url": "<url if launch>", "selector": "<css selector>", "text": "<text if type>"}
-
-Rules:
-- Call ONE tool at a time. Wait for the result before calling the next.
-- Tool results arrive as messages with role tool.
-- Write complete production-quality code with error handling. No placeholders.
-- Be direct. Talk like a senior colleague.
-"""
-
-RE_XML_TOOL  = re.compile(r"<tool_call[^>]*>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE)
-RE_JSON_TOOL = re.compile(r"```(?:json)?\s*(\{[^`]*\"tool_use\"[^`]*\})\s*```", re.DOTALL)
-
-def extract_tool_call(text):
-    try:
-        obj = json.loads(text.strip())
-        if "tool_use" in obj:
-            tu = obj["tool_use"]
-            return tu.get("name"), tu.get("parameters", {})
-    except Exception:
-        pass
-    m = RE_JSON_TOOL.search(text)
-    if m:
-        try:
-            obj = json.loads(m.group(1))
-            tu = obj.get("tool_use", {})
-            return tu.get("name"), tu.get("parameters", {})
-        except Exception:
-            pass
-    m = RE_XML_TOOL.search(text)
-    if m:
-        inner = m.group(1).strip()
-        try:
-            obj = json.loads(inner)
-            name   = obj.get("name") or obj.get("tool") or obj.get("function")
-            params = obj.get("parameters") or obj.get("arguments") or obj.get("args") or {}
-            if name:
-                return name, params
-        except Exception:
-            pass
-        tag = re.search(r"<([a-z_]+)>(.*?)</\1>", inner, re.DOTALL)
-        if tag:
-            name = tag.group(1)
-            try:
-                params = json.loads(tag.group(2).strip())
-            except Exception:
-                params = {"value": tag.group(2).strip()}
-            return name, params
-    return None, None
-
-def build_tool_call_response(name, params, original):
-    call_id = "call_" + uuid.uuid4().hex[:8]
-    return {
-        "id": original.get("id", "chatcmpl-intercepted"),
-        "object": "chat.completion",
-        "created": original.get("created", 0),
-        "model": original.get("model", MODEL),
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(params)}
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }],
-        "usage": original.get("usage", {})
-    }
-
-def inject_system_prompt(messages):
-    if not messages:
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
-    if messages[0].get("role") != "system":
-        return [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-    existing = messages[0].get("content", "")
-    if "TOOL CALL PROTOCOL" not in existing:
-        messages = list(messages)
-        messages[0] = {"role": "system", "content": existing + "\n\n" + SYSTEM_PROMPT}
-    return messages
-
-class Interceptor(http.server.BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin",  "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-        self.send_header("Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-Requested-With, Accept, "
-            "X-Api-Key, api-key, x-stainless-os, x-stainless-lang, "
-            "x-stainless-package-version, x-stainless-runtime, "
-            "x-stainless-runtime-version, x-stainless-arch")
-        self.send_header("Access-Control-Max-Age", "86400")
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._cors()
-        self.end_headers()
-
-    def _fwd(self, body=None):
-        url  = BACKEND + self.path
-        hdrs = {k: v for k, v in self.headers.items()
-                if k.lower() not in ("host", "content-length", "authorization", "api-key", "x-api-key")}
-        hdrs["Host"] = "127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
-        if body is not None:
-            hdrs["Content-Length"] = str(len(body))
-        req = urllib.request.Request(url, data=body, headers=hdrs, method=self.command)
-        try:
-            r = urllib.request.urlopen(req, timeout=600)
-            st, rh, rb = r.status, r.headers, r.read()
-        except urllib.error.HTTPError as e:
-            st, rh, rb = e.code, e.headers, e.read()
-        self.send_response(st)
-        self._cors()
-        for k, v in rh.items():
-            if k.lower() == "content-type":
-                self.send_header(k, v)
-        self.send_header("Content-Length", str(len(rb)))
-        self.end_headers()
-        self.wfile.write(rb)
-
-    def do_GET(self):    self._fwd()
-    def do_DELETE(self): self._fwd()
-
-    def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw    = self.rfile.read(length)
-        is_chat = "/chat/completions" in self.path or "/api/chat" in self.path
-        if not is_chat:
-            self._fwd(raw)
-            return
-        try:
-            payload = json.loads(raw)
-            payload["messages"] = inject_system_prompt(payload.get("messages", []))
-            payload["model"] = MODEL
-            payload.setdefault("temperature", float(os.environ.get("TEMPERATURE", "0.2")))
-            payload.setdefault("options", {})
-            payload["options"].setdefault("num_ctx",       int(os.environ.get("CTX_SIZE", "8192")))
-            payload["options"].setdefault("repeat_penalty", 1.05)
-            payload["options"].setdefault("top_p", 0.95)
-            payload["options"].setdefault("top_k", 64)
-            if payload.get("stream", False):
-                self._fwd(json.dumps(payload).encode())
-                return
-            raw = json.dumps(payload).encode()
-            url  = BACKEND + self.path
-            hdrs = {k: v for k, v in self.headers.items()
-                    if k.lower() not in ("host", "content-length", "authorization", "api-key", "x-api-key")}
-            hdrs["Host"]           = "127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
-            hdrs["Content-Length"] = str(len(raw))
-            req = urllib.request.Request(url, data=raw, headers=hdrs, method="POST")
-            try:
-                r = urllib.request.urlopen(req, timeout=600)
-                st, rh, rb = r.status, r.headers, r.read()
-            except urllib.error.HTTPError as e:
-                st, rh, rb = e.code, e.headers, e.read()
-                self._reply(st, rb)
-                return
-            try:
-                resp_obj = json.loads(rb)
-            except Exception:
-                self._fwd_raw(st, rh, rb)
-                return
-            assistant_text = ""
-            try:
-                assistant_text = resp_obj["choices"][0]["message"]["content"] or ""
-            except Exception:
-                pass
-            tool_name, tool_params = extract_tool_call(assistant_text)
-            if tool_name:
-                print("[interceptor] tool call: " + tool_name, flush=True)
-                body = json.dumps(build_tool_call_response(tool_name, tool_params, resp_obj)).encode()
-                self._reply(200, body)
-                return
-            self._fwd_raw(200, rh, rb)
-        except Exception:
-            traceback.print_exc()
-            self._fwd(raw)
-
-    def _fwd_raw(self, status, headers, body):
-        self.send_response(status)
-        self._cors()
-        for k, v in headers.items():
-            if k.lower() == "content-type":
-                self.send_header(k, v)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _reply(self, status, body):
-        self.send_response(status)
-        self._cors()
-        self.send_header("Content-Type",   "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-srv = http.server.HTTPServer(("0.0.0.0", PORT), Interceptor)
-print("[interceptor] :" + str(PORT) + " -> " + BACKEND, flush=True)
-srv.serve_forever()
-'''
-
-pathlib.Path("/tmp/interceptor.py").write_text(code)
-print("interceptor.py written successfully.")
-PYEOF
-
       - name: Start interceptor proxy
         run: |
           PROXY_PORT=$PROXY_PORT \
@@ -326,19 +85,19 @@ PYEOF
           MODEL=$MODEL \
           TEMPERATURE=$TEMPERATURE \
           CTX_SIZE=$CTX_SIZE \
-          nohup python3 /tmp/interceptor.py > proxy.log 2>&1 &
+          nohup python3 .github/workflows/interceptor.py > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 3
           curl -sf "http://127.0.0.1:$PROXY_PORT/api/tags" > /dev/null 2>&1 \
             && echo "Proxy healthy on :$PROXY_PORT" \
             || { echo "Proxy health check failed"; cat proxy.log; }
 
-      - name: Verify system prompt and model response
+      - name: Verify model response
         run: |
           RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer test" \
-            -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Who are you?\"}],\"max_tokens\":120}" \
+            -d '{"model":"gemma4:e4b","stream":false,"messages":[{"role":"user","content":"Who are you?"}],"max_tokens":80}' \
             2>/dev/null)
           CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // "NO CONTENT"' 2>/dev/null)
           echo "Model replied: $CONTENT"
@@ -358,17 +117,14 @@ PYEOF
             --loglevel info \
             > tunnel.log 2>&1 &
           echo $! > tunnel.pid
-
           TUNNEL_URL=""
           for i in $(seq 1 40); do
             TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
             [ -n "$TUNNEL_URL" ] && { TUNNEL_URL="${TUNNEL_URL%/}"; break; }
             sleep 2
           done
-
           [ -z "$TUNNEL_URL" ] && { echo "WARNING: tunnel URL not found"; cat tunnel.log | tail -20; }
           echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-
           echo "=================================================="
           echo "  GEMMA4:E4B + OLLAMA - SENIOR ENGINEER READY"
           echo "=================================================="
@@ -380,7 +136,7 @@ PYEOF
           echo "    Provider  : OpenAI-compatible"
           echo "    Base URL  : ${TUNNEL_URL}/v1"
           echo "    Model ID  : $MODEL"
-          echo "    API Key   : roo  (any non-empty string)"
+          echo "    API Key   : roo"
           echo "--------------------------------------------------"
           echo "  Tool call interception : ACTIVE"
           echo "  CORS headers           : permissive (*)"
@@ -392,7 +148,7 @@ PYEOF
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer roo" \
-            -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function that reads a JSON file safely.\"}],\"max_tokens\":300}" \
+            -d '{"model":"gemma4:e4b","stream":false,"messages":[{"role":"user","content":"Write a Python function that reads a JSON file safely."}],"max_tokens":300}' \
             2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
             || echo "Smoke test parse failed"
 
@@ -429,7 +185,6 @@ PYEOF
           [ -f ollama.pid ] && kill -9 "$(cat ollama.pid)" 2>/dev/null || true
           pkill -9 -f cloudflared 2>/dev/null || true
           pkill -9 -f ollama      2>/dev/null || true
-          pkill -9 -f interceptor 2>/dev/null || true
           sudo fuser -k "$PROXY_PORT/tcp"  2>/dev/null || true
           sudo fuser -k "$OLLAMA_PORT/tcp" 2>/dev/null || true
           rm -f ./*.pid
