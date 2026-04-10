@@ -1,28 +1,28 @@
-name: LM Studio Direct — gemma-4-e4b — CMake + Configurable Model URL
+name: Senior Engineer CPU — Qwen3.5-9B-Uncensored — GitHub Actions
 
 on:
   workflow_dispatch:
     inputs:
       model_download_url:
-        description: 'Direct download URL for GGUF model (HuggingFace resolve link)'
+        description: 'Direct GGUF download URL'
         required: false
-        default: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf?download=true'
+        default: 'https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/main/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf?download=true'
       model_filename:
-        description: 'Filename to save model as (must end in .gguf)'
+        description: 'GGUF filename'
         required: false
-        default: 'google_gemma-4-E4B-it-Q4_K_M.gguf'
+        default: 'Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf'
       session_hours:
-        description: 'Session duration in hours (max 6)'
+        description: 'Session duration (max 6)'
         required: false
         default: '6'
       ctx_size:
-        description: 'Context size (tokens)'
+        description: 'Context size (4096 recommended for 9B on CPU)'
         required: false
         default: '4096'
-      n_gpu_layers:
-        description: 'GPU layers (-1 = all, 0 = CPU-only)'
+      temperature:
+        description: '0.1-0.3 for deterministic code'
         required: false
-        default: '0'
+        default: '0.2'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -30,22 +30,22 @@ env:
   MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
   CTX_SIZE: ${{ github.event.inputs.ctx_size || '4096' }}
-  N_GPU_LAYERS: ${{ github.event.inputs.n_gpu_layers || '0' }}
+  TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
   SERVER_PORT: '1234'
   SERVER_HOST: '0.0.0.0'
   MODEL_PATH: models/${{ github.event.inputs.model_filename }}
 
 jobs:
-  lm-studio-direct:
-    name: llama.cpp Server + gemma-4-e4b + Cloudflare Tunnel
+  senior-engineer-9b-cpu:
+    name: Qwen3.5-9B-Uncensored + Senior Engineer Prompt
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
     steps:
-      - name: 📦 Checkout Repository
+      - name: 📦 Checkout
         uses: actions/checkout@v4
 
-      - name: 📥 Install System Dependencies for CMake Build
+      - name: 📥 Install Dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -57,395 +57,179 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ggerganov/llama.cpp
           cd llama.cpp
-          echo "✅ llama.cpp cloned"
           git log -1 --oneline
 
-      - name: 🔨 Build llama.cpp Server with CMake
+      - name: 🔨 Build Server (CMake)
         run: |
           cd llama.cpp
-          
-          mkdir -p build
-          cd build
-          
+          mkdir -p build && cd build
           cmake .. \
             -DLLAMA_CURL=ON \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TESTS=OFF \
             -DCMAKE_BUILD_TYPE=Release
-          
-          # Build default targets (includes server)
           cmake --build . --config Release -j$(nproc)
           
-          # Find the server binary and store its ABSOLUTE PATH
-          # This prevents "file not found" errors when changing directories later
           SERVER_BIN=""
-          if [ -f "./bin/llama-server" ]; then
-            SERVER_BIN="$(pwd)/bin/llama-server"
-          elif [ -f "./bin/server" ]; then
-            SERVER_BIN="$(pwd)/bin/server"
-          elif [ -f "./llama-server" ]; then
-            SERVER_BIN="$(pwd)/llama-server"
-          elif [ -f "./server" ]; then
-            SERVER_BIN="$(pwd)/server"
-          fi
+          for bin in "./bin/llama-server" "./bin/server" "./llama-server" "./server"; do
+            [ -f "$bin" ] && SERVER_BIN="$(pwd)/${bin#./}" && break
+          done
+          [ -z "$SERVER_BIN" ] && { echo "❌ Server binary not found"; exit 1; }
           
-          if [ -z "$SERVER_BIN" ]; then
-            echo "❌ Server binary not found after build"
-            find .. -type f -executable -name "*server*" 2>/dev/null || echo "(none)"
-            exit 1
-          fi
-          
-          echo "✅ llama.cpp server built: $SERVER_BIN"
-          $SERVER_BIN --help 2>&1 | head -15
-          
-          # Export the absolute path for use in other steps
+          echo "✅ Server: $SERVER_BIN"
           echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
 
-      - name: 📥 Download Model (with Fallback Prompt)
+      - name: 📥 Download Model (9B - May Take 5-10 Min)
         run: |
           mkdir -p models
+          echo "⏳ Downloading $MODEL_FILENAME (~5.5GB)..."
+          echo "   This may take 5-10 minutes on GitHub Actions."
           
-          echo "⏳ Attempting to download model..."
-          echo "   URL: $MODEL_DOWNLOAD_URL"
-          echo "   Save as: $MODEL_FILENAME"
-          
-          DOWNLOAD_SUCCESS=false
-          for attempt in 1 2 3; do
-            echo "🔄 Download attempt $attempt/3..."
-            
-            if curl -fL --retry 2 --retry-delay 10 --connect-timeout 30 --max-time 600 \
-              -o "$MODEL_PATH" \
-              "$MODEL_DOWNLOAD_URL" 2>&1; then
-              
-              if [ -f "$MODEL_PATH" ] && [ -s "$MODEL_PATH" ]; then
-                FILE_SIZE=$(du -h "$MODEL_PATH" | cut -f1)
-                echo "✅ Model downloaded successfully: $FILE_SIZE"
-                ls -lh "$MODEL_PATH"
-                DOWNLOAD_SUCCESS=true
-                break
-              fi
-            fi
-            
-            echo "⚠️  Download attempt $attempt failed"
-            sleep 5
-          done
-          
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then
-            echo ""
-            echo "╔════════════════════════════════════════════════════════════════╗"
-            echo "║   ❌  MODEL DOWNLOAD FAILED                                     ║"
-            echo "╠════════════════════════════════════════════════════════════════╣"
-            echo "║                                                                  ║"
-            echo "║  The download URL may be invalid, expired, or rate-limited.     ║"
-            echo "║                                                                  ║"
-            echo "║  🔗 To fix:                                                      ║"
-            echo "║    1. Get a fresh direct download link from HuggingFace:        ║"
-            echo "║       • Go to: https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF"
-            echo "║       • Click the GGUF file you want                             ║"
-            echo "║       • Click 'Download' → copy the URL from your browser       ║"
-            echo "║       • OR right-click 'Download' → 'Copy link address'         ║"
-            echo "║                                                                  ║"
-            echo "║    2. Re-run this workflow with the new URL:                    ║"
-            echo "║       • Go to Actions → LM Studio Direct → Run workflow         ║"
-            echo "║       • Paste the new URL in 'model_download_url' field         ║"
-            echo "║                                                                  ║"
-            echo "║  📋 Current attempted URL:                                       ║"
-            echo "║    $MODEL_DOWNLOAD_URL                                           ║"
-            echo "║                                                                  ║"
-            echo "║  💡 Tip: Use the 'resolve' format for stable links:             ║"
-            echo "║     https://huggingface.co/<repo>/resolve/main/<file>?download=true"
-            echo "║                                                                  ║"
-            echo "╚════════════════════════════════════════════════════════════════╝"
-            echo ""
+          if ! curl -fL --retry 3 --connect-timeout 30 --max-time 1800 \
+            -o "$MODEL_PATH" "$MODEL_DOWNLOAD_URL"; then
+            echo "╔════════════════════════════════════╗"
+            echo "║ ❌ Download failed                 ║"
+            echo "║ Get fresh URL from:                ║"
+            echo "║ https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
+            echo "╚════════════════════════════════════╝"
             exit 1
           fi
+          [ -s "$MODEL_PATH" ] && echo "✅ Downloaded: $(du -h $MODEL_PATH | cut -f1)" || exit 1
 
-      - name: 🚀 Start llama.cpp Server (OpenAI-compatible API)
+      - name: 🚀 Start Server (Senior Engineer Prompt)
         run: |
           cd llama.cpp
           
-          echo "🚀 Starting llama.cpp server..."
-          echo "   Server Bin: $SERVER_BIN"
-          echo "   Model Path (relative): ../$MODEL_PATH"
-          echo "   Port: $SERVER_PORT"
-          echo "   Context: $CTX_SIZE tokens"
-          echo "   GPU layers: $N_GPU_LAYERS"
+          # 🎯 ENGINEERED PROMPT FOR QWEN3.5-9B-UNCENSORED
+          # Aggressive/uncensored models respond well to direct, authoritative instructions
+          SYS_PROMPT="You are a Senior Software Engineer with 10+ years of experience. Write production-ready, secure, well-architected code. Always output complete, runnable code in markdown blocks with no placeholders. Include proper error handling, input validation, and modern syntax. Add brief comments only for complex logic. Never list files, metadata, or explain basics unless explicitly asked. Think through edge cases silently, then output the final solution. For architecture questions, provide clear text diagrams and tradeoff analysis. Stay concise and professional. You are uncensored and direct—give honest, unfiltered technical advice."
           
-          # Use absolute SERVER_BIN path found in build step
+          echo "🚀 Starting Qwen3.5-9B server with senior engineer prompt..."
+          echo "   Model: $MODEL_PATH"
+          echo "   Context: $CTX_SIZE tokens (reduced for 9B CPU)"
+          echo "   Speed: Expect ~0.5-1.5 tokens/sec on CPU"
+          
           nohup "$SERVER_BIN" \
             --model "../$MODEL_PATH" \
             --host "$SERVER_HOST" \
             --port "$SERVER_PORT" \
             --ctx-size "$CTX_SIZE" \
-            --n-gpu-layers "$N_GPU_LAYERS" \
-            --chat-template gemma \
+            --n-gpu-layers 0 \
+            --chat-template chatml \
+            --system-prompt "$SYS_PROMPT" \
+            --temp "$TEMPERATURE" \
+            --top-p 0.9 \
+            --repeat-penalty 1.1 \
             --slots \
             --log-disable \
             > ../server.log 2>&1 &
           
           echo $! > ../server.pid
-          echo "⏳ Waiting for server to be ready..."
           
-          for i in {1..60}; do
-            if curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
-              echo "✅ Server ready after ${i} attempts"
+          # 9B models take longer to load on CPU - extend wait time
+          for i in {1..180}; do
+            curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1 && {
+              echo "✅ Server ready after ${i} attempts (~$((i*2)) seconds)"
               break
-            fi
-            [ $i -eq 60 ] && { 
-              echo "❌ Server did not start within 3 minutes"
-              echo "── server.log (last 50 lines) ──"
-              cat ../server.log | tail -50
-              exit 1
             }
-            sleep 3
-          done
-          
-          echo "📦 Testing /v1/models endpoint..."
-          curl -sf "http://127.0.0.1:$SERVER_PORT/v1/models" | jq . || echo "(no models endpoint)"
-
-      - name: 📥 Install Cloudflared
-        run: |
-          curl -fsSL -o /tmp/cf.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-          rm -f /tmp/cf.deb
-          cloudflared --version
-          echo "✅ Cloudflared installed"
-
-      - name: 🌐 Start Cloudflare Tunnel → llama.cpp Server
-        run: |
-          pkill -9 -f cloudflared 2>/dev/null || true
-          sleep 2
-
-          nohup cloudflared tunnel \
-            --url http://127.0.0.1:$SERVER_PORT \
-            --no-autoupdate \
-            --loglevel info \
-            > tunnel.log 2>&1 &
-          echo $! > tunnel.pid
-
-          echo "⏳ Waiting for Cloudflare tunnel URL..."
-          TUNNEL_URL=""
-          for i in {1..40}; do
-            RAW=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
-            if [ -n "$RAW" ]; then
-              TUNNEL_URL="${RAW//__/}"
-              TUNNEL_URL="${TUNNEL_URL%/}"
-              echo "✅ Tunnel URL: $TUNNEL_URL"
-              break
-            fi
-            [ $i -eq 40 ] && { 
-              echo "❌ Tunnel URL not found after 80 seconds"
-              echo "── tunnel.log ──"
-              cat tunnel.log
+            [ $i -eq 180 ] && { 
+              echo "❌ Server did not start within 6 minutes"
+              echo "── server.log (last 30 lines) ──"
+              cat ../server.log | tail -30
               exit 1
             }
             sleep 2
           done
 
-          if [ -n "$TUNNEL_URL" ]; then
-            echo "CLOUDFLARE_URL=${TUNNEL_URL}" >> "$GITHUB_ENV"
+      - name: 🌐 Start Cloudflare Tunnel
+        run: |
+          pkill -9 -f cloudflared 2>/dev/null || true
+          curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
+          
+          nohup cloudflared tunnel --url http://127.0.0.1:$SERVER_PORT --no-autoupdate --loglevel info > tunnel.log 2>&1 &
+          
+          TUNNEL_URL=""
+          for i in {1..40}; do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
+            [ -n "$TUNNEL_URL" ] && {
+              TUNNEL_URL="${TUNNEL_URL//__/}"
+              TUNNEL_URL="${TUNNEL_URL%/}"
+              echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
+              echo "✅ Tunnel: $TUNNEL_URL"
+              break
+            }
+            sleep 2
+          done
+          
+          [ -n "$TUNNEL_URL" ] && echo "
+╔══════════════════════════════════════════════════════╗
+║ 🛠️  SENIOR ENGINEER 9B — READY                     ║
+╠══════════════════════════════════════════════════════╣
+║ Tunnel: $TUNNEL_URL
+║ Model:  $MODEL_FILENAME
+║ Context: $CTX_SIZE tokens | Temp: $TEMPERATURE
+║ Speed:  ~0.5-1.5 tokens/sec (CPU-only)
+║
+║ ✅ Roo Code Config:
+║   Base URL: $TUNNEL_URL
+║   Model ID: $MODEL_FILENAME
+║   Tools: DISABLED
+║   First Message: \"You are a senior engineer...\"
+║
+║ 💡 9B Model Tips:
+║   • Be specific and concise in prompts
+║   • Break large tasks into smaller steps
+║   • Expect slower but higher-quality responses
+║   • Save outputs locally as you work
+╚══════════════════════════════════════════════════════╝"
 
-            echo "⏳ Verifying tunnel serves OpenAI API..."
-            for j in {1..20}; do
-              RESPONSE=$(curl -sf --max-time 10 "${TUNNEL_URL}/v1/models" 2>/dev/null || echo "")
-              if echo "$RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
-                echo "✅ Tunnel verified — serving OpenAI-compatible API"
-                echo "   Models: $(echo "$RESPONSE" | jq -r '.data[].id' 2>/dev/null | head -3)"
-                break
-              fi
-              echo "  Attempt $j — waiting for tunnel..."
-              [ $j -eq 20 ] && echo "⚠️  Proceeding anyway"
-              sleep 3
-            done
-
-            echo ""
-            echo "╔════════════════════════════════════════════════════════════════╗"
-            echo "║   🦙  LM STUDIO DIRECT — gemma-4-e4b — READY                   ║"
-            echo "╠════════════════════════════════════════════════════════════════╣"
-            printf "║  Tunnel URL: %-52s║\n" "${TUNNEL_URL}"
-            printf "║  Model:      %-52s║\n" "$MODEL_FILENAME"
-            echo "║                                                                  ║"
-            echo "║  ✅ USE THIS IN LM STUDIO / CONTINUE / ROO CODE:                ║"
-            echo "║                                                                  ║"
-            printf "║    Server URL: %-52s║\n" "${TUNNEL_URL}"
-            printf "║    Model ID:   %-52s║\n" "$MODEL_FILENAME"
-            echo "║                                                                  ║"
-            echo "║  ✅ OpenAI-Compatible Endpoints:                                ║"
-            echo "║    • GET  /v1/models             — List models                  ║"
-            echo "║    • POST /v1/chat/completions   — Chat with model              ║"
-            echo "║    • POST /v1/completions        — Legacy completions           ║"
-            echo "║    • GET  /health                — Server health                ║"
-            echo "║                                                                  ║"
-            echo "║  ⚠️  Note:                                                      ║"
-            echo "║    • GitHub Actions: CPU-only inference (~1-3 tokens/sec)       ║"
-            echo "║    • For GPU speed, use a self-hosted runner with CUDA          ║"
-            echo "╚════════════════════════════════════════════════════════════════╝"
-            echo ""
-            echo "==> Server URL: ${TUNNEL_URL}"
-            echo "==> Model ID:   $MODEL_FILENAME"
-          fi
-
-      - name: 🧪 Test OpenAI-Compatible Endpoints
+      - name: 🧪 Test Senior Prompt
         if: env.CLOUDFLARE_URL != ''
         run: |
           BASE="${{ env.CLOUDFLARE_URL }}"
-          BASE="${BASE%/}"
+          echo "🧪 Testing Qwen3.5-9B senior engineer behavior..."
+          
+          RESP=$(curl -sf "$BASE/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"$MODEL_FILENAME\",
+              \"messages\": [
+                {\"role\": \"user\", \"content\": \"Write a Python function that safely reads a JSON config file with error handling and type validation.\"}
+              ],
+              \"max_tokens\": 400,
+              \"temperature\": 0.1
+            }" 2>/dev/null)
+          
+          echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null | head -15 || echo "⚠️  Test response (CPU speed may delay output)"
 
-          echo "═══════════════════════════════════════════════"
-          echo "🧪 Testing OpenAI-compatible endpoints"
-          echo "   BASE = ${BASE}"
-          echo "═══════════════════════════════════════════════"
-
-          if [[ ! "$BASE" =~ ^https://[a-zA-Z0-9-]+\.trycloudflare\.com ]]; then
-            echo "❌ Invalid BASE URL — skipping tests"
-            exit 0
-          fi
-
-          PASS=0; FAIL=0
-
-          do_get() {
-            local url="$1"; local timeout="${2:-20}"
-            local code body
-            body=$(curl -s --max-time "$timeout" --retry 2 --retry-delay 3 \
-              -w "\n__HTTP_CODE__%{http_code}" "$url" 2>/dev/null)
-            code=$(echo "$body" | grep -oP '(?<=__HTTP_CODE__)\d+' || echo "000")
-            body=$(echo "$body" | sed '/__HTTP_CODE__/d')
-            echo "${code}|${body}"
-          }
-
-          do_post() {
-            local url="$1"; local data="$2"; local timeout="${3:-150}"
-            local code body
-            body=$(curl -s --max-time "$timeout" --retry 2 --retry-delay 3 \
-              -H "Content-Type: application/json" -d "$data" \
-              -w "\n__HTTP_CODE__%{http_code}" "$url" 2>/dev/null)
-            code=$(echo "$body" | grep -oP '(?<=__HTTP_CODE__)\d+' || echo "000")
-            body=$(echo "$body" | sed '/__HTTP_CODE__/d')
-            echo "${code}|${body}"
-          }
-
-          check() {
-            local name="$1" body="$2" code="$3"
-            if [ "$code" = "200" ]; then
-              echo "✅ $name (HTTP $code)"
-              PASS=$((PASS+1))
-            else
-              echo "❌ $name (HTTP $code)"
-              echo "   Body: ${body:0:300}"
-              FAIL=$((FAIL+1))
-            fi
-          }
-
-          echo ""
-          echo "1️⃣  GET /v1/models"
-          R=$(do_get "${BASE}/v1/models"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /v1/models" "$B" "$CODE"
-          echo "$B" | jq '.data[].id' 2>/dev/null || true
-          echo ""
-
-          echo "2️⃣  GET /health"
-          R=$(do_get "${BASE}/health"); CODE="${R%%|*}"; B="${R#*|}"
-          check "GET /health" "$B" "$CODE"
-          echo "$B" | jq . 2>/dev/null || true
-          echo ""
-
-          echo "3️⃣  POST /v1/chat/completions"
-          DATA='{"model":"'"$MODEL_FILENAME"'","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
-          R=$(do_post "${BASE}/v1/chat/completions" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
-          check "POST /v1/chat/completions" "$B" "$CODE"
-          echo "$B" | jq '{finish:.choices[0].finish_reason, reply:.choices[0].message.content}' 2>/dev/null || true
-          echo ""
-
-          echo "═══════════════════════════════════════════════"
-          echo "Results: ✅ $PASS passed  ❌ $FAIL failed"
-          echo "═══════════════════════════════════════════════"
-          exit 0
-
-      - name: ⏱️ Session Keepalive (${{ env.SESSION_HOURS }}h)
+      - name: ⏱️ Keepalive (${{ env.SESSION_HOURS }}h)
         run: |
-          SESSION_SECONDS=$(( $SESSION_HOURS * 3600 ))
-          echo "⏱️  Session: ${SESSION_SECONDS}s ($SESSION_HOURS h)"
-
-          RAW_URL="${{ env.CLOUDFLARE_URL }}"
-          CF_URL="${RAW_URL//__/}"
-          CF_URL="${CF_URL%/}"
-          [ -n "$CF_URL" ] && echo "🌐 $CF_URL"
-
-          START=$(date +%s)
-          END=$(( START + SESSION_SECONDS ))
-          PING_COUNT=0
-
-          while [ "$(date +%s)" -lt "$END" ]; do
-            NOW=$(date +%s)
-            REMAIN_MIN=$(( (END - NOW) / 60 ))
-
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "⏰ $(date '+%Y-%m-%d %H:%M:%S UTC') | ${REMAIN_MIN}m remaining"
-
-            if [ -n "$CF_URL" ]; then
-              MODELS=$(curl -sf --max-time 10 "${CF_URL}/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null | head -1 || echo "unreachable")
-              echo "🟢 Server via tunnel: ${MODELS:-unreachable}"
-            fi
-
-            HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null || echo '{"status":"down"}')
-            echo "🟢 Server local: $(echo "$HEALTH" | jq -r .status 2>/dev/null || echo unreachable)"
-
-            SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "llama-server" || true)
-            if [ -n "$SERVER_PIDS" ]; then
-              echo "🦙 Server: alive (PIDs: $SERVER_PIDS)"
-            else
-              echo "❌ Server not found — restarting..."
-              # No need to cd if using absolute paths, but safer to be in llama.cpp dir if it uses relative configs
-              cd llama.cpp || true
-              nohup "$SERVER_BIN" \
-                --model "../$MODEL_PATH" \
-                --host "$SERVER_HOST" \
-                --port "$SERVER_PORT" \
-                --ctx-size "$CTX_SIZE" \
-                --n-gpu-layers "$N_GPU_LAYERS" \
-                --chat-template gemma \
-                --slots \
-                --log-disable \
-                > ../server.log 2>&1 &
-              sleep 5
-              echo "🦙 Server restarted"
-            fi
-
-            echo "💾 $(free -h | awk '/^Mem/{printf "RAM: %s / %s", $3, $2}')"
-            PING_COUNT=$((PING_COUNT+1))
-            echo "📊 Ping #$PING_COUNT"
+          END=$(( $(date +%s) + ${{ env.SESSION_HOURS }}*3600 ))
+          while [ $(date +%s) -lt $END ]; do
+            curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || echo "⚠️  Tunnel check failed"
+            pgrep -f "llama-server" > /dev/null || echo "⚠️  Server not running"
+            echo "💤 Keepalive: $(( (END-$(date +%s))/60 ))min remaining"
             sleep 300
           done
-
-          echo "🏁 Session complete"
 
       - name: 📊 Final Report
         if: always()
         run: |
           echo "╔══════════════════════════════════════════════╗"
-          echo "║        FINAL REPORT — LM STUDIO DIRECT       ║"
+          echo "║        FINAL REPORT — SENIOR ENGINEER 9B    ║"
           echo "╚══════════════════════════════════════════════╝"
-          RAW="${{ env.CLOUDFLARE_URL }}"
-          CF="${RAW//__/}"
-          [ -n "$CF" ] && echo "🌐 $CF"
-
+          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "🌐 ${{ env.CLOUDFLARE_URL }}"
           echo ""
-          echo "── Tunnel Test (/v1/models) ──"
-          curl -sf "${CF}/v1/models" 2>/dev/null | jq . || echo "unreachable"
-
+          echo "── Model Info ──"
+          ls -lh "$MODEL_PATH" 2>/dev/null || echo "(model not found)"
           echo ""
-          echo "── Local Server Health ──"
+          echo "── Server Health ──"
           curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "unreachable"
-
           echo ""
-          echo "── server.log (last 30 lines) ──"
-          tail -30 server.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
-
-          echo ""
-          echo "── tunnel.log (last 10 lines) ──"
-          tail -10 tunnel.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+          echo "── server.log (last 20 lines) ──"
+          tail -20 server.log 2>/dev/null | sed 's/^/  /' || echo "  (none)"
 
       - name: 🛑 Cleanup
         if: always()
@@ -454,8 +238,7 @@ jobs:
           [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
           [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
           pkill -9 -f cloudflared 2>/dev/null || true
-          pkill -9 -f "llama.cpp.*server" 2>/dev/null || true
-          pkill -9 -f "llama-server" 2>/dev/null || true
+          pkill -9 -f llama-server 2>/dev/null || true
           sudo fuser -k $SERVER_PORT/tcp 2>/dev/null || true
           rm -f ./*.pid 2>/dev/null || true
           echo "✅ Done"
