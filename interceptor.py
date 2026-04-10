@@ -6,7 +6,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 PROXY_PORT = int(os.getenv('PROXY_PORT', '1234'))
 OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', '127.0.0.1')
-MODEL = os.getenv('MODEL', 'gemma4:e4b0s')
+MODEL = os.getenv('MODEL', 'gemma4:e4b')
 TEMPERATURE = float(os.getenv('TEMPERATURE', '0.2'))
 CTX_SIZE = int(os.getenv('CTX_SIZE', '8192'))
 OLLAMA_URL = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
