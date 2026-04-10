@@ -1,5 +1,4 @@
-# .github/workflows/senior-engineer-ollama.yml
-name: Senior Engineer - Ollama Gemma3 4B
+name: Senior Engineer - Ollama Gemma4 e4b0s
 
 on:
   workflow_dispatch:
@@ -18,25 +17,21 @@ on:
         default: '0.2'
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
   CTX_SIZE: ${{ github.event.inputs.ctx_size || '8192' }}
   TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
   OLLAMA_PORT: '11434'
   PROXY_PORT: '1234'
-  MODEL: 'gemma3:4b'
+  MODEL: 'gemma4:e4b0s'
 
 jobs:
-  senior-engineer-ollama-gemma3:
-    name: Gemma3-4B via Ollama - Senior Engineer
+  senior-engineer-ollama-gemma4:
+    name: Gemma4:e4b0s via Ollama
     runs-on: ubuntu-latest
     timeout-minutes: 400
-    permissions:
-      contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Kill stale processes
         run: |
@@ -48,251 +43,95 @@ jobs:
           sleep 2
           echo "✅ Ports cleared"
 
-      - name: Install system dependencies
+      - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget jq python3 python3-pip
-          pip3 install --quiet flask requests
+          sudo apt-get install -y -qq curl wget jq python3
+          python3 --version
 
       - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
 
-      - name: Start Ollama server
+      - name: Start Ollama
         run: |
-          OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT \
-          OLLAMA_KEEP_ALIVE=-1 \
-          OLLAMA_NUM_PARALLEL=1 \
-          nohup ollama serve > ollama.log 2>&1 &
-          echo $! > ollama.pid
-          
-          echo "⏳ Waiting for Ollama HTTP server..."
+          OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 nohup ollama serve > ollama.log 2>&1 &
           for i in $(seq 1 60); do
-            if curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1; then
-              echo "✅ Ollama API ready after $((i*2))s"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "❌ ERROR: Ollama never became ready"
-              cat ollama.log
-              exit 1
-            fi
+            curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1 && { echo "✅ Ollama ready"; break; }
+            [ "$i" -eq 60 ] && { echo "❌ Ollama failed"; cat ollama.log; exit 1; }
             sleep 2
           done
 
-      - name: Pull model
+      - name: Pull & Warm Model
         run: |
-          echo "📦 Pulling $MODEL ..."
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull "$MODEL"
-          echo "📋 Available models:"
-          OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
-
-      - name: Warm up model
-        run: |
-          echo "🔥 Warming up $MODEL ..."
-          WARM=$(curl -sf \
-            "http://127.0.0.1:$OLLAMA_PORT/v1/chat/completions" \
+          echo "Warming up..."
+          curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/chat" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}" \
-            --max-time 180 2>/dev/null)
-          CONTENT=$(echo "$WARM" | jq -r '.choices[0].message.content // "no content"' 2>/dev/null)
-          echo "Warmup response: $CONTENT"
-          if [ -z "$CONTENT" ] || [ "$CONTENT" = "no content" ]; then
-            echo "❌ ERROR: Warmup failed"
-            tail -40 ollama.log
-            exit 1
-          fi
-          echo "✅ Model is warm and ready"
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":5}}" \
+            --max-time 120 > /dev/null
+          echo "✅ Model warm"
 
-      - name: Verify interceptor.py exists
+      - name: Start Proxy
         run: |
-          if [ ! -f "interceptor.py" ]; then
-            echo "❌ ERROR: interceptor.py not found in repository root"
-            echo "Please create the file or check your checkout step"
-            exit 1
-          fi
-          echo "✅ interceptor.py found"
-          python3 -m py_compile interceptor.py && echo "✅ Python syntax OK"
-
-      - name: Start interceptor proxy
-        run: |
-          export PROXY_PORT=$PROXY_PORT
-          export OLLAMA_PORT=$OLLAMA_PORT
-          export MODEL=$MODEL
-          export TEMPERATURE=$TEMPERATURE
-          export CTX_SIZE=$CTX_SIZE
-          
-          nohup python3 interceptor.py > proxy.log 2>&1 &
+          python3 interceptor.py > proxy.log 2>&1 &
           echo $! > proxy.pid
-          echo "🔄 Proxy started with PID: $(cat proxy.pid)"
+          sleep 2
           
-          echo "⏳ Waiting for proxy health check..."
-          for i in $(seq 1 30); do
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              "http://127.0.0.1:$PROXY_PORT/health" --max-time 5 2>/dev/null)
-            if [ "$HTTP" = "200" ]; then
-              echo "✅ Proxy healthy on :$PROXY_PORT after ${i}s"
-              break
-            fi
-            if [ "$i" -eq 30 ]; then
-              echo "❌ ERROR: Proxy never became healthy (last HTTP: $HTTP)"
-              echo "--- proxy.log ---"
-              cat proxy.log
-              echo "--- Port check ---"
-              ss -tlnp | grep $PROXY_PORT || echo "Nothing listening on $PROXY_PORT"
-              exit 1
-            fi
+          # IMMEDIATE CRASH CHECK
+          if ! kill -0 $(cat proxy.pid) 2>/dev/null; then
+            echo "❌ Proxy died immediately on startup!"
+            echo "=== proxy.log ==="
+            cat proxy.log
+            exit 1
+          fi
+          echo "✅ Proxy process alive (PID: $(cat proxy.pid))"
+          
+          echo "Waiting for /health endpoint..."
+          for i in $(seq 1 15); do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PROXY_PORT/health" --max-time 3 2>/dev/null)
+            [ "$HTTP" = "200" ] && { echo "✅ Proxy healthy on :$PROXY_PORT"; break; }
+            [ "$i" -eq 15 ] && { echo "❌ Health check failed (last: $HTTP)"; cat proxy.log; exit 1; }
             sleep 1
           done
 
-      - name: Verify end-to-end through proxy
+      - name: Verify End-to-End
         run: |
-          RESP=$(curl -sf \
-            "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
+          RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer test" \
-            -d '{"model":"gemma3:4b","stream":false,"messages":[{"role":"user","content":"Reply with one word: ready"}],"max_tokens":10}' \
-            --max-time 60 2>/dev/null)
-          CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
-          echo "📨 Proxy replied: $CONTENT"
-          if [ -z "$CONTENT" ]; then
-            echo "❌ ERROR: No response through proxy"
-            echo "--- ollama.log (tail) ---"
-            tail -30 ollama.log
-            echo "--- proxy.log (tail) ---"
-            tail -20 proxy.log
-            exit 1
-          fi
-          echo "✅ End-to-end verified"
+            -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Reply: ready"}],"max_tokens":5}' --max-time 30)
+          CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty')
+          echo "Proxy replied: $CONTENT"
+          [ -z "$CONTENT" ] && { echo "❌ Empty response"; cat proxy.log; exit 1; }
 
-      - name: Install and start Cloudflare tunnel
+      - name: Cloudflare Tunnel
         run: |
-          pkill -9 -f cloudflared 2>/dev/null || true
-          sleep 1
-          
-          curl -fsSL -o /tmp/cf.deb \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
+          curl -fsSL -o /tmp/cf.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-          
-          nohup cloudflared tunnel \
-            --url "http://127.0.0.1:$PROXY_PORT" \
-            --no-autoupdate \
-            --loglevel info \
-            > tunnel.log 2>&1 &
+          nohup cloudflared tunnel --url "http://127.0.0.1:$PROXY_PORT" --no-autoupdate > tunnel.log 2>&1 &
           echo $! > tunnel.pid
           
-          TUNNEL_URL=""
+          URL=""
           for i in $(seq 1 40); do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              TUNNEL_URL="${TUNNEL_URL%/}"
-              break
-            fi
-            sleep 2
+            URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
+            [ -n "$URL" ] && break; sleep 2
           done
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ ERROR: No tunnel URL found"
-            cat tunnel.log
-            exit 1
-          fi
-          
-          echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-          
-          echo "🔍 Verifying tunnel connectivity..."
-          for i in $(seq 1 15); do
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              "$TUNNEL_URL/health" --max-time 15 2>/dev/null)
-            if [ "$HTTP" = "200" ]; then
-              echo "✅ Tunnel verified (HTTP $HTTP)"
-              break
-            fi
-            echo "  Attempt $i: HTTP $HTTP, retrying..."
-            sleep 3
-          done
-          
-          echo ""
-          echo "╔════════════════════════════════════════════════════╗"
-          echo "║  🎉 GEMMA3:4B + OLLAMA - SENIOR ENGINEER READY    ║"
-          echo "╠════════════════════════════════════════════════════╣"
-          echo "║  Tunnel URL : $TUNNEL_URL"
-          echo "║  Model      : $MODEL"
-          echo "║  Context    : $CTX_SIZE tokens"
-          echo "╠────────────────────────────────────────────────────╣"
-          echo "║  Roo Code / Continue settings:"
-          echo "║    Provider  : OpenAI-compatible"
-          echo "║    Base URL  : ${TUNNEL_URL}/v1"
-          echo "║    Model ID  : $MODEL"
-          echo "║    API Key   : roo"
-          echo "╠────────────────────────────────────────────────────╣"
-          echo "║  ✅ Tool call interception : ACTIVE"
-          echo "║  ✅ CORS headers           : permissive (*)"
-          echo "╚════════════════════════════════════════════════════╝"
+          [ -z "$URL" ] && { echo "❌ No tunnel URL"; cat tunnel.log; exit 1; }
+          echo "CLOUDFLARE_URL=${URL%/}" >> $GITHUB_ENV
+          echo "✅ Tunnel: $URL"
 
-      - name: Smoke test via tunnel
-        if: env.CLOUDFLARE_URL != ''
-        run: |
-          echo "🧪 Running smoke test through tunnel..."
-          RESP=$(curl -sf \
-            "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer roo" \
-            -d '{"model":"gemma3:4b","stream":false,"messages":[{"role":"user","content":"Write a Python function that reads a JSON file safely with error handling."}],"max_tokens":300}' \
-            --max-time 90 2>/dev/null)
-          if echo "$RESP" | jq -e '.choices[0].message.content' > /dev/null 2>&1; then
-            echo "✅ Smoke test passed"
-            echo "$RESP" | jq -r '.choices[0].message.content'
-          else
-            echo "⚠️ Smoke test parse warning (may be streaming or error):"
-            echo "$RESP" | head -20
-          fi
-
-      - name: Keepalive loop
+      - name: Keepalive
         run: |
           END=$(( $(date +%s) + SESSION_HOURS * 3600 ))
-          echo "⏱️ Keepalive: Session ends in $SESSION_HOURS hours"
           while [ "$(date +%s)" -lt "$END" ]; do
-            REMAINING=$(( (END - $(date +%s)) / 60 ))
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              "http://127.0.0.1:$PROXY_PORT/health" --max-time 5 2>/dev/null)
-            if [ "$HTTP" != "200" ]; then
-              echo "⚠️ Proxy health: $HTTP (may recover)"
-            fi
-            echo "💓 Keepalive: ${REMAINING}min remaining - $(date -u '+%H:%M:%S UTC')"
+            REM=$(( (END - $(date +%s)) / 60 ))
+            echo "💓 ${REM}min left - $(date -u '+%H:%M UTC')"
             sleep 300
           done
 
-      - name: Final report
+      - name: Cleanup
         if: always()
         run: |
-          echo ""
-          echo "📊 ========== FINAL REPORT =========="
-          echo "Tunnel URL: ${{ env.CLOUDFLARE_URL || '(not available)' }}"
-          echo ""
-          echo "📦 Ollama models:"
-          curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" 2>/dev/null | jq . || echo "Ollama unreachable"
-          echo ""
-          echo "📋 proxy.log (last 20 lines):"
-          tail -20 proxy.log 2>/dev/null || echo "(none)"
-          echo ""
-          echo "📋 ollama.log (last 30 lines):"
-          tail -30 ollama.log 2>/dev/null || echo "(none)"
-          echo ""
-          echo "📋 tunnel.log (last 10 lines):"
-          tail -10 tunnel.log 2>/dev/null || echo "(none)"
-
-      - name: Cleanup resources
-        if: always()
-        run: |
-          echo "🧹 Cleaning up..."
-          for pidfile in tunnel.pid proxy.pid ollama.pid; do
-            [ -f "$pidfile" ] && kill -9 "$(cat "$pidfile")" 2>/dev/null || true
-          done
-          pkill -9 -f cloudflared 2>/dev/null || true
-          pkill -9 -f "ollama serve" 2>/dev/null || true
-          pkill -9 -f "python.*interceptor" 2>/dev/null || true
-          sudo fuser -k "$PROXY_PORT/tcp" 2>/dev/null || true
-          sudo fuser -k "$OLLAMA_PORT/tcp" 2>/dev/null || true
-          rm -f ./*.pid /tmp/cf.deb
-          echo "✅ Cleanup complete"
+          for f in proxy.pid ollama.pid tunnel.pid; do [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null || true; done
+          pkill -9 -f cloudflared 2>/dev/null || true; pkill -9 -f ollama 2>/dev/null || true
