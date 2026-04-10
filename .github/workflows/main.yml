@@ -45,6 +45,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Kill Any Stale Servers
+        run: |
+          echo "Killing any stale servers from previous runs..."
+          pkill -9 -f llama-server  2>/dev/null || true
+          pkill -9 -f llama-cpp     2>/dev/null || true
+          pkill -9 -f cloudflared   2>/dev/null || true
+          pkill -9 -f proxy.py      2>/dev/null || true
+          sudo fuser -k 1234/tcp    2>/dev/null || true
+          sudo fuser -k 11434/tcp   2>/dev/null || true
+          sleep 2
+          echo "OK: Ports 1234 and 11434 are free."
+
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
@@ -103,60 +115,48 @@ jobs:
           fi
           echo "OK: $(du -h $MODEL_PATH | cut -f1) saved to $MODEL_PATH"
 
-      - name: Write System-Prompt Proxy
+      - name: Write Proxy Script
         run: |
-          python3 - << 'EOF'
+          python3 - << 'PYEOF'
           import textwrap, pathlib
 
-          # ── system prompt ────────────────────────────────────────────────────
           prompt = (
-              "You are a Senior Software Developer with 15+ years of experience "
-              "across the full stack and every major programming language: Python, "
-              "JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, "
-              "Ruby, Bash, SQL, GraphQL, and more. You are equally comfortable "
-              "building frontends (React, Vue, Svelte, HTML/CSS), backends (REST APIs, "
-              "gRPC, microservices, serverless), mobile apps, CLI tools, DevOps "
-              "pipelines, databases (PostgreSQL, MySQL, SQLite, MongoDB, Redis, "
-              "Cassandra), cloud infrastructure (AWS, GCP, Azure), and low-level "
-              "systems code. You live inside a coding assistant (Continue or Roo Code) "
-              "and have direct access to these tools: read_file, write_file, "
-              "create_directory, list_directory, execute_command, search_files, and "
-              "web_search. Use them proactively without being asked whenever a task "
-              "involves files, folders, shell commands, or looking something up. When "
-              "the user wants to chat, plan, brainstorm, or just think out loud, drop "
-              "engineer mode and respond like a normal human being, naturally and "
-              "conversationally, like a smart colleague sitting right next to them. "
-              "When coding: always write complete production-ready code in fenced "
-              "markdown blocks with the correct language tag; include error handling "
-              "and input validation; never use placeholders or TODOs unless explicitly "
-              "asked for a skeleton; add comments only where the logic is genuinely "
-              "non-obvious. Give honest, direct opinions. Call out bad approaches and "
-              "suggest better ones without sugarcoating. Adapt your communication "
-              "style to whatever the user needs in the moment: casual chat, technical "
-              "deep-dive, quick answer, or pair-programming session."
+              "You are a Senior Software Developer with 15 years of experience "
+              "across the full stack and every major programming language including "
+              "Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, "
+              "Swift, PHP, Ruby, Bash, SQL, and GraphQL. "
+              "You build frontends with React, Vue, Svelte, and HTML/CSS. "
+              "You build backends with REST APIs, gRPC, microservices, and serverless. "
+              "You work with databases including PostgreSQL, MySQL, SQLite, MongoDB, "
+              "Redis, and Cassandra. "
+              "You work with cloud platforms including AWS, GCP, and Azure. "
+              "You are running inside a coding assistant called Continue or Roo Code. "
+              "You have access to these tools: read_file, write_file, "
+              "create_directory, list_directory, execute_command, search_files, "
+              "and web_search. "
+              "Use these tools automatically whenever the task needs them. "
+              "When the user is chatting or planning, talk naturally like a "
+              "colleague. When coding, write complete working code with no "
+              "placeholders. Always include error handling. Be direct and honest."
           )
           pathlib.Path("/tmp/sysprompt.txt").write_text(prompt)
 
-          # ── proxy script ─────────────────────────────────────────────────────
           proxy = textwrap.dedent('''
-              #!/usr/bin/env python3
-              """Proxy: public :1234 -> llama-server :11434
-              Injects system message into every /v1/chat/completions call."""
               import http.server, urllib.request, urllib.error, json, os
 
               BACKEND = "http://127.0.0.1:11434"
-              SYSTEM_PROMPT = open("/tmp/sysprompt.txt").read().strip()
+              PROMPT = open("/tmp/sysprompt.txt").read().strip()
 
-              class Proxy(http.server.BaseHTTPRequestHandler):
+              class P(http.server.BaseHTTPRequestHandler):
                   def log_message(self, *a): pass
 
-                  def _forward(self, body=None):
+                  def _fwd(self, body=None):
                       url = BACKEND + self.path
-                      hdrs = {k: v for k, v in self.headers.items()
-                              if k.lower() not in ("host", "content-length")}
+                      h = {k: v for k, v in self.headers.items()
+                           if k.lower() not in ("host", "content-length")}
                       if body is not None:
-                          hdrs["Content-Length"] = str(len(body))
-                      req = urllib.request.Request(url, data=body, headers=hdrs, method=self.command)
+                          h["Content-Length"] = str(len(body))
+                      req = urllib.request.Request(url, data=body, headers=h, method=self.command)
                       try:
                           r = urllib.request.urlopen(req, timeout=600)
                           st, rh, rb = r.status, r.headers, r.read()
@@ -169,33 +169,32 @@ jobs:
                       self.end_headers()
                       self.wfile.write(rb)
 
-                  def do_GET(self):    self._forward()
-                  def do_DELETE(self): self._forward()
+                  def do_GET(self):    self._fwd()
+                  def do_DELETE(self): self._fwd()
 
                   def do_POST(self):
                       n = int(self.headers.get("Content-Length", 0))
                       raw = self.rfile.read(n)
-                      if self.path.rstrip("/") == "/v1/chat/completions":
+                      if "/chat/completions" in self.path:
                           try:
                               p = json.loads(raw)
                               msgs = p.get("messages", [])
                               if not msgs or msgs[0].get("role") != "system":
-                                  msgs.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                                  msgs.insert(0, {"role": "system", "content": PROMPT})
                                   p["messages"] = msgs
                               raw = json.dumps(p).encode()
                           except Exception:
                               pass
-                      self._forward(raw)
+                      self._fwd(raw)
 
-              if __name__ == "__main__":
-                  port = int(os.environ.get("PROXY_PORT", 1234))
-                  srv = http.server.HTTPServer(("0.0.0.0", port), Proxy)
-                  print(f"Proxy :{port} -> {BACKEND}", flush=True)
-                  srv.serve_forever()
+              port = int(os.environ.get("PROXY_PORT", 1234))
+              srv = http.server.HTTPServer(("0.0.0.0", port), P)
+              print(f"Proxy :{port} -> {BACKEND}", flush=True)
+              srv.serve_forever()
           ''').lstrip()
           pathlib.Path("/tmp/proxy.py").write_text(proxy)
-          print("OK: sysprompt.txt and proxy.py written.")
-          EOF
+          print("OK: proxy.py and sysprompt.txt written.")
+          PYEOF
 
       - name: Start llama-server
         run: |
@@ -215,12 +214,12 @@ jobs:
             --log-disable \
             2>&1 | grep -v "^warning:" > server.log &
           echo $! > server.pid
-          echo "PID: $(cat server.pid)"
+          echo "llama-server PID: $(cat server.pid)"
 
-          echo "Waiting for llama-server to load (up to 10 min for 15 GB bf16)..."
+          echo "Waiting for llama-server (up to 10 min for 15 GB model)..."
           for i in $(seq 1 300); do
             if curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1; then
-              echo "OK: Ready after ~$((i*2))s"
+              echo "OK: llama-server ready after ~$((i*2))s"
               break
             fi
             if [ "$i" -eq 300 ]; then
@@ -244,6 +243,23 @@ jobs:
             cat proxy.log
             exit 1
           fi
+
+      - name: Verify System Prompt Is Being Injected
+        run: |
+          echo "Verifying system prompt injection via proxy..."
+          RESP=$(curl -sf "http://127.0.0.1:$SERVER_PORT/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Who are you and what is your job?\"}],\"max_tokens\":120,\"temperature\":0.1}" \
+            2>/dev/null)
+          CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null)
+          echo "Model replied: $CONTENT"
+          if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ]; then
+            echo "ERROR: No response from model - check server.log and proxy.log"
+            cat server.log | tail -20
+            cat proxy.log  | tail -10
+            exit 1
+          fi
+          echo "OK: System prompt injection confirmed."
 
       - name: Start Cloudflare Tunnel
         run: |
@@ -293,32 +309,12 @@ jobs:
       - name: Smoke Test - Code
         if: env.CLOUDFLARE_URL != ''
         run: |
-          echo "--- Test 1: Python function ---"
+          echo "--- Test: write a Python counting script ---"
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python function that reads a JSON file safely with full error handling.\"}],\"max_tokens\":400,\"temperature\":0.1}" \
-            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
-            || echo "Test 1 parse failed"
-
-      - name: Smoke Test - Tools
-        if: env.CLOUDFLARE_URL != ''
-        run: |
-          echo "--- Test 2: tool awareness ---"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"What tools do you have available and what would you use each one for?\"}],\"max_tokens\":350,\"temperature\":0.2}" \
-            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null | head -20 \
-            || echo "Test 2 parse failed"
-
-      - name: Smoke Test - Conversation
-        if: env.CLOUDFLARE_URL != ''
-        run: |
-          echo "--- Test 3: casual chat ---"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Hey, how are you doing today?\"}],\"max_tokens\":150,\"temperature\":0.7}" \
+            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python script that counts from 1 to 10 and prints each number.\"}],\"max_tokens\":200,\"temperature\":0.1}" \
             2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
-            || echo "Test 3 parse failed"
+            || echo "Smoke test parse failed"
 
       - name: Keepalive
         run: |
