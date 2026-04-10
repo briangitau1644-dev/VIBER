@@ -95,29 +95,36 @@ jobs:
       - name: Create Cloudflare Tunnel
         id: tunnel
         run: |
+          # Start tunnel with correct flags (no -keepalive flag)
           cloudflared tunnel --url http://localhost:11434 \
             --http-host-header localhost:11434 \
-            --protocol http2 \
-            --keepalive 30s \
             --logfile cloudflared.log &
           
-          sleep 20
+          TUNNEL_PID=$!
           
+          # Wait for tunnel to establish
+          sleep 15
+          
+          # Extract tunnel URL from logs
           TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
           
           if [ -z "$TUNNEL_URL" ]; then
             echo "❌ Failed to get tunnel URL"
-            cat cloudflared.log
+            echo "Cloudflared log contents:"
+            cat cloudflared.log 2>/dev/null || echo "No log file"
             exit 1
           fi
           
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
           
-          if curl -s "$TUNNEL_URL/api/tags" > /dev/null; then
+          # Test tunnel is working
+          echo "🔍 Testing tunnel..."
+          sleep 5
+          if curl -s "$TUNNEL_URL/api/tags" > /dev/null 2>&1; then
             echo "✅ Tunnel is working"
           else
-            echo "⚠️ Tunnel test failed"
+            echo "⚠️ Tunnel test failed, but continuing..."
           fi
           
           echo ""
@@ -125,7 +132,7 @@ jobs:
           echo "✅ TUNNEL ACTIVE: $TUNNEL_URL"
           echo "=========================================="
           echo ""
-          echo "📋 VS CODE CONTINUE CONFIGURATION:"
+          echo "📋 COPY THIS CONFIGURATION for VS Code Continue:"
           echo ""
           echo "{"
           echo '  "models": ['
@@ -167,43 +174,66 @@ jobs:
           echo "🧪 TEST COMMAND: curl $TUNNEL_URL/api/tags"
           echo "⏱️ Tunnel active for ${{ github.event.inputs.duration }} hours"
           echo ""
+          
+          # Save URL to file for heartbeat step
+          echo "$TUNNEL_URL" > tunnel_url.txt
       
       - name: Keep Runner Alive with Heartbeat
         run: |
-          TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          if [ -f tunnel_url.txt ]; then
+            TUNNEL_URL=$(cat tunnel_url.txt)
+          else
+            TUNNEL_URL="${{ steps.tunnel.outputs.tunnel_url }}"
+          fi
+          
           DURATION_HOURS=${{ github.event.inputs.duration }}
           DURATION_SECONDS=$((DURATION_HOURS * 3600))
           ELAPSED=0
           
           echo "🟢 Tunnel active at: $TUNNEL_URL"
           echo "🟢 Will run for $DURATION_HOURS hours"
+          echo "🟢 Press 'Cancel workflow' in GitHub Actions to stop early"
           echo ""
           
           while [ $ELAPSED -lt $DURATION_SECONDS ]; do
-            if curl -s "$TUNNEL_URL/api/tags" > /dev/null 2>&1; then
-              echo "✅ [$(date '+%H:%M:%S')] Heartbeat OK"
+            if curl -s -m 5 "$TUNNEL_URL/api/tags" > /dev/null 2>&1; then
+              echo "✅ [$(date '+%H:%M:%S')] Heartbeat OK - Tunnel responding"
             else
-              echo "⚠️ [$(date '+%H:%M:%S')] Heartbeat WARNING"
-              pkill cloudflared || true
-              cloudflared tunnel --url http://localhost:11434 --http-host-header localhost:11434 &
-              sleep 10
+              echo "⚠️ [$(date '+%H:%M:%S')] Heartbeat WARNING - Tunnel not responding"
+              # Check if cloudflared is still running
+              if ! pgrep -f "cloudflared" > /dev/null; then
+                echo "🔄 Restarting cloudflared..."
+                cloudflared tunnel --url http://localhost:11434 --http-host-header localhost:11434 --logfile cloudflared.log &
+              fi
             fi
             
             sleep 60
             ELAPSED=$((ELAPSED + 60))
             
+            # Show progress every hour
             if [ $((ELAPSED % 3600)) -eq 0 ]; then
-              HOURS_REMAINING=$(((DURATION_SECONDS - ELAPSED) / 3600))
-              echo "📊 $((ELAPSED / 3600))/$DURATION_HOURS hours elapsed, $HOURS_REMAINING hours remaining"
+              HOURS_ELAPSED=$((ELAPSED / 3600))
+              HOURS_REMAINING=$((DURATION_HOURS - HOURS_ELAPSED))
+              echo "📊 Status: $HOURS_ELAPSED/$DURATION_HOURS hours elapsed, $HOURS_REMAINING hours remaining"
             fi
           done
+          
+          echo ""
+          echo "⏰ Workflow completed after $DURATION_HOURS hours"
       
       - name: Cleanup on Failure
         if: failure()
         run: |
           echo "❌ Workflow failed. Collecting logs..."
+          echo ""
           echo "=== OLLAMA LOGS ==="
           tail -50 ollama.log 2>/dev/null || echo "No ollama.log found"
           echo ""
           echo "=== CLOUDFLARE LOGS ==="
           tail -50 cloudflared.log 2>/dev/null || echo "No cloudflared.log found"
+          echo ""
+          echo "=== OLLAMA PROCESS STATUS ==="
+          ps aux | grep ollama | grep -v grep || echo "Ollama not running"
+          echo ""
+          echo "=== PORT STATUS ==="
+          netstat -tlnp 2>/dev/null | grep 11434 || ss -tlnp | grep 11434 || echo "Port 11434 not listening"
