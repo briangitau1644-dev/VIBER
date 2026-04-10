@@ -1,289 +1,280 @@
-name: Senior Engineer - Ollama Gemma3 4B
+#!/usr/bin/env python3
+"""
+interceptor.py - OpenAI-compatible proxy for Ollama with tool call interception
+Handles CORS, request transformation, and deterministic generation settings.
+"""
 
-on:
-  workflow_dispatch:
-    inputs:
-      session_hours:
-        description: 'Session duration (max 6)'
-        required: false
-        default: '6'
-      ctx_size:
-        description: 'Context size'
-        required: false
-        default: '8192'
-      temperature:
-        description: '0.1-0.3 for deterministic code'
-        required: false
-        default: '0.2'
+import os
+import sys
+import json
+import time
+import logging
+import requests
+from flask import Flask, request, jsonify, Response
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  CTX_SIZE:      ${{ github.event.inputs.ctx_size || '8192' }}
-  TEMPERATURE:   ${{ github.event.inputs.temperature || '0.2' }}
-  OLLAMA_PORT:   '11434'
-  PROXY_PORT:    '1234'
-  MODEL:         'gemma3:4b'
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger(__name__)
 
-jobs:
-  senior-engineer-ollama-gemma3:
-    name: Gemma3-4B via Ollama - Senior Engineer
-    runs-on: ubuntu-latest
-    timeout-minutes: 400
+app = Flask(__name__)
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# Configuration from environment
+PROXY_PORT = int(os.getenv('PROXY_PORT', '1234'))
+OLLAMA_PORT = int(os.getenv('OLLAMA_PORT', '11434'))
+OLLAMA_HOST = os.getenv('OLLAMA_HOST', '127.0.0.1')
+MODEL = os.getenv('MODEL', 'gemma3:4b')
+TEMPERATURE = float(os.getenv('TEMPERATURE', '0.2'))
+CTX_SIZE = int(os.getenv('CTX_SIZE', '8192'))
 
-      - name: Kill stale processes
-        run: |
-          pkill -9 -f ollama      2>/dev/null || true
-          pkill -9 -f cloudflared 2>/dev/null || true
-          sudo fuser -k $PROXY_PORT/tcp  2>/dev/null || true
-          sudo fuser -k $OLLAMA_PORT/tcp 2>/dev/null || true
-          sleep 2
-          echo "Ports clear."
+OLLAMA_BASE = f"http://{OLLAMA_HOST}:{OLLAMA_PORT}"
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget jq python3
+# CORS headers helper
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
 
-      - name: Install Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          ollama --version
+@app.before_request
+def log_request():
+    logger.info(f"{request.method} {request.path} from {request.remote_addr}")
 
-      - name: Start Ollama server
-        run: |
-          OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT \
-          OLLAMA_KEEP_ALIVE=-1 \
-          OLLAMA_NUM_PARALLEL=1 \
-          nohup ollama serve > ollama.log 2>&1 &
-          echo $! > ollama.pid
+@app.after_request
+def after_request(response):
+    return add_cors_headers(response)
 
-          echo "Waiting for Ollama HTTP server..."
-          for i in $(seq 1 60); do
-            if curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" \
-                > /dev/null 2>&1; then
-              echo "Ollama API ready after ${i}x2s"
-              break
-            fi
-            if [ "$i" -eq 60 ]; then
-              echo "ERROR: Ollama never became ready"
-              cat ollama.log
-              exit 1
-            fi
-            sleep 2
-          done
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            return jsonify({"status": "healthy", "ollama": "connected"}), 200
+    except Exception as e:
+        logger.warning(f"Health check failed: {e}")
+    return jsonify({"status": "degraded", "error": str(e)}), 503
 
-      - name: Pull model
-        run: |
-          echo "Pulling $MODEL ..."
-          OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull "$MODEL"
-          echo "--- available models ---"
-          OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
+@app.route('/api/tags', methods=['GET'])
+def list_models():
+    """Proxy Ollama's model list endpoint"""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=30)
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
+    except Exception as e:
+        logger.error(f"Failed to fetch models: {e}")
+        return jsonify({"error": str(e)}), 502
 
-      - name: Warm up model
-        run: |
-          echo "Warming up $MODEL - loading weights into RAM..."
-          WARM=$(curl -sf \
-            "http://127.0.0.1:$OLLAMA_PORT/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}" \
-            --max-time 180 2>/dev/null)
-          CONTENT=$(echo "$WARM" \
-            | jq -r '.choices[0].message.content // "no content"' \
-            2>/dev/null)
-          echo "Warmup response: $CONTENT"
-          if [ -z "$CONTENT" ] || [ "$CONTENT" = "no content" ]; then
-            echo "ERROR: Warmup failed"
-            cat ollama.log | tail -40
-            exit 1
-          fi
-          echo "Model is warm and ready."
+@app.route('/v1/models', methods=['GET'])
+def openai_list_models():
+    """OpenAI-compatible model listing"""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=30)
+        data = resp.json()
+        models = []
+        for m in data.get('models', []):
+            models.append({
+                "id": m.get('name', MODEL),
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "ollama"
+            })
+        # Ensure our target model is listed
+        if not any(m['id'] == MODEL for m in models):
+            models.append({
+                "id": MODEL,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "ollama"
+            })
+        return jsonify({"object": "list", "data": models})
+    except Exception as e:
+        logger.error(f"Failed to list OpenAI models: {e}")
+        return jsonify({"error": str(e)}), 502
 
-      - name: Verify interceptor.py exists
-        run: |
-          ls -lh interceptor.py
-          echo "Python syntax check..."
-          python3 -m py_compile interceptor.py && echo "Syntax OK"
+@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
+def chat_completions():
+    """OpenAI-compatible chat completions endpoint with tool interception"""
+    if request.method == 'OPTIONS':
+        return '', 204
+    
+    try:
+        req_data = request.get_json(force=True)
+    except Exception as e:
+        logger.error(f"Invalid JSON: {e}")
+        return jsonify({"error": "Invalid JSON"}), 400
+    
+    # Extract and normalize parameters
+    model = req_data.get('model', MODEL)
+    messages = req_data.get('messages', [])
+    stream = req_data.get('stream', False)
+    max_tokens = req_data.get('max_tokens', req_data.get('max_completion_tokens', 2048))
+    temperature = req_data.get('temperature', TEMPERATURE)
+    tools = req_data.get('tools', None)
+    
+    # Transform OpenAI messages to Ollama format
+    ollama_messages = []
+    for msg in messages:
+        role = msg.get('role', 'user')
+        content = msg.get('content', '')
+        # Handle tool calls if present
+        if role == 'assistant' and 'tool_calls' in msg:
+            for tc in msg['tool_calls']:
+                ollama_messages.append({
+                    'role': 'assistant',
+                    'content': f"[Tool call: {tc.get('function', {}).get('name')}]"
+                })
+        elif role == 'tool':
+            # Convert tool response to user message for Ollama
+            ollama_messages.append({
+                'role': 'user',
+                'content': f"[Tool response]: {content}"
+            })
+        else:
+            ollama_messages.append({'role': role, 'content': content})
+    
+    # Build Ollama request
+    ollama_payload = {
+        'model': model,
+        'messages': ollama_messages,
+        'stream': stream,
+        'options': {
+            'temperature': temperature,
+            'num_ctx': CTX_SIZE,
+            'num_predict': max_tokens
+        }
+    }
+    
+    # Tool interception logic: if tools requested, we may intercept certain patterns
+    intercepted_response = None
+    if tools:
+        intercepted_response = _intercept_tool_calls(messages, tools)
+    
+    if intercepted_response:
+        logger.info("🎯 Tool call intercepted - returning synthetic response")
+        result = {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": intercepted_response},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": len(intercepted_response.split()), "total_tokens": 0}
+        }
+        return jsonify(result)
+    
+    try:
+        # Forward to Ollama
+        ollama_url = f"{OLLAMA_BASE}/v1/chat/completions" if stream else f"{OLLAMA_BASE}/api/chat"
+        
+        if stream:
+            # Streaming: proxy Ollama's streaming response
+            def generate():
+                try:
+                    with requests.post(ollama_url, json=ollama_payload, stream=True, timeout=120) as resp:
+                        for line in resp.iter_lines():
+                            if line:
+                                yield line + b'\n'
+                except Exception as e:
+                    logger.error(f"Streaming error: {e}")
+                    yield f'data: {json.dumps({"error": str(e)})}\n\n'.encode()
+            
+            return Response(generate(), mimetype='text/event-stream')
+        else:
+            # Non-streaming: transform Ollama response to OpenAI format
+            resp = requests.post(f"{OLLAMA_BASE}/api/chat", json=ollama_payload, timeout=180)
+            resp.raise_for_status()
+            ollama_result = resp.json()
+            
+            content = ollama_result.get('message', {}).get('content', '')
+            
+            openai_result = {
+                "id": f"chatcmpl-{int(time.time())}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": ollama_result.get('done_reason', 'stop')
+                }],
+                "usage": {
+                    "prompt_tokens": ollama_result.get('prompt_eval_count', 0),
+                    "completion_tokens": ollama_result.get('eval_count', 0),
+                    "total_tokens": ollama_result.get('prompt_eval_count', 0) + ollama_result.get('eval_count', 0)
+                }
+            }
+            return jsonify(openai_result)
+            
+    except requests.exceptions.Timeout:
+        logger.error("Ollama request timeout")
+        return jsonify({"error": "Gateway timeout"}), 504
+    except requests.exceptions.ConnectionError:
+        logger.error("Cannot connect to Ollama")
+        return jsonify({"error": "Ollama unavailable"}), 502
+    except Exception as e:
+        logger.error(f"Proxy error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
-      - name: Start interceptor proxy
-        run: |
-          PROXY_PORT=$PROXY_PORT \
-          OLLAMA_PORT=$OLLAMA_PORT \
-          MODEL=$MODEL \
-          TEMPERATURE=$TEMPERATURE \
-          CTX_SIZE=$CTX_SIZE \
-          nohup python3 interceptor.py > proxy.log 2>&1 &
-          echo $! > proxy.pid
-          echo "Proxy PID: $(cat proxy.pid)"
+def _intercept_tool_calls(messages, tools):
+    """
+    Intercept specific tool call patterns for deterministic responses.
+    Returns a string response if intercepted, None otherwise.
+    """
+    if not messages:
+        return None
+    
+    last_msg = messages[-1].get('content', '').lower() if isinstance(messages[-1], dict) else str(messages[-1]).lower()
+    
+    # Example intercept patterns for senior engineer tasks
+    intercept_patterns = {
+        'create file': 'I can help with that. To create a file in this environment, use: `echo "content" > filename` or Python `open("filename", "w").write("content")`. What file would you like to create?',
+        'run command': 'For safety, commands should be reviewed first. What command would you like to run? I can help validate it.',
+        'read file': 'To read a file: `cat filename` or in Python `open("filename").read()`. Which file?',
+        'install package': 'Use `pip install package-name` for Python or `sudo apt install package` for system packages. Which package?',
+    }
+    
+    for pattern, response in intercept_patterns.items():
+        if pattern in last_msg:
+            return response
+    
+    return None
 
-          echo "Waiting for proxy to be healthy..."
-          for i in $(seq 1 30); do
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              "http://127.0.0.1:$PROXY_PORT/health" \
-              --max-time 5 2>/dev/null)
-            if [ "$HTTP" = "200" ]; then
-              echo "Proxy healthy on :$PROXY_PORT after ${i}x1s"
-              break
-            fi
-            if [ "$i" -eq 30 ]; then
-              echo "ERROR: Proxy never became healthy (last HTTP: $HTTP)"
-              echo "--- proxy.log ---"
-              cat proxy.log
-              echo "--- checking if port is listening ---"
-              ss -tlnp | grep $PROXY_PORT || echo "nothing on $PROXY_PORT"
-              exit 1
-            fi
-            sleep 1
-          done
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint with API info"""
+    return jsonify({
+        "service": "Ollama Interceptor Proxy",
+        "model": MODEL,
+        "endpoints": [
+            "/health",
+            "/api/tags",
+            "/v1/models", 
+            "/v1/chat/completions"
+        ],
+        "cors": "enabled"
+    })
 
-      - name: Verify end-to-end through proxy
-        run: |
-          RESP=$(curl -sf \
-            "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer test" \
-            -d '{"model":"gemma3:4b","stream":false,"messages":[{"role":"user","content":"Reply with one word: ready"}],"max_tokens":10}' \
-            --max-time 60 2>/dev/null)
-          CONTENT=$(echo "$RESP" \
-            | jq -r '.choices[0].message.content // empty' \
-            2>/dev/null)
-          echo "Proxy replied: $CONTENT"
-          if [ -z "$CONTENT" ]; then
-            echo "ERROR: No response through proxy"
-            echo "--- ollama.log ---"
-            tail -30 ollama.log
-            echo "--- proxy.log ---"
-            tail -20 proxy.log
-            exit 1
-          fi
-          echo "End-to-end verified."
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({"error": "Not found", "path": request.path}), 404
 
-      - name: Install and start Cloudflare tunnel
-        run: |
-          pkill -9 -f cloudflared 2>/dev/null || true
-          sleep 1
+@app.errorhandler(500)
+def internal_error(e):
+    logger.error(f"Internal error: {e}")
+    return jsonify({"error": "Internal server error"}), 500
 
-          curl -fsSL \
-            -o /tmp/cf.deb \
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
-          sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-
-          nohup cloudflared tunnel \
-            --url "http://127.0.0.1:$PROXY_PORT" \
-            --no-autoupdate \
-            --loglevel info \
-            > tunnel.log 2>&1 &
-          echo $! > tunnel.pid
-
-          TUNNEL_URL=""
-          for i in $(seq 1 40); do
-            TUNNEL_URL=$(grep -oP \
-              'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              tunnel.log 2>/dev/null | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              TUNNEL_URL="${TUNNEL_URL%/}"
-              break
-            fi
-            sleep 2
-          done
-
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "ERROR: No tunnel URL found"
-            cat tunnel.log
-            exit 1
-          fi
-
-          echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-
-          echo "Verifying tunnel can reach proxy..."
-          for i in $(seq 1 15); do
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              "$TUNNEL_URL/health" --max-time 15 2>/dev/null)
-            if [ "$HTTP" = "200" ]; then
-              echo "Tunnel verified, HTTP $HTTP"
-              break
-            fi
-            echo "  attempt $i: HTTP $HTTP, retrying..."
-            if [ "$i" -eq 15 ]; then
-              echo "WARNING: tunnel health never returned 200 (last: $HTTP)"
-            fi
-            sleep 3
-          done
-
-          echo "=================================================="
-          echo "  GEMMA3:4B + OLLAMA - SENIOR ENGINEER READY"
-          echo "=================================================="
-          echo "  Tunnel URL : $TUNNEL_URL"
-          echo "  Model      : $MODEL"
-          echo "  Context    : $CTX_SIZE tokens"
-          echo "--------------------------------------------------"
-          echo "  Roo Code / Continue settings"
-          echo "    Provider  : OpenAI-compatible"
-          echo "    Base URL  : ${TUNNEL_URL}/v1"
-          echo "    Model ID  : $MODEL"
-          echo "    API Key   : roo"
-          echo "--------------------------------------------------"
-          echo "  Tool call interception : ACTIVE"
-          echo "  CORS headers           : permissive (*)"
-          echo "=================================================="
-
-      - name: Smoke test via tunnel
-        if: env.CLOUDFLARE_URL != ''
-        run: |
-          echo "Running smoke test through tunnel..."
-          RESP=$(curl -sf \
-            "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer roo" \
-            -d '{"model":"gemma3:4b","stream":false,"messages":[{"role":"user","content":"Write a Python function that reads a JSON file safely with error handling."}],"max_tokens":300}' \
-            --max-time 90 2>/dev/null)
-          echo "$RESP" \
-            | jq -r '.choices[0].message.content' 2>/dev/null \
-            || echo "Smoke test parse failed: $RESP"
-
-      - name: Keepalive
-        run: |
-          END=$(( $(date +%s) + SESSION_HOURS * 3600 ))
-          while [ "$(date +%s)" -lt "$END" ]; do
-            REMAINING=$(( (END - $(date +%s)) / 60 ))
-            HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-              "http://127.0.0.1:$PROXY_PORT/health" \
-              --max-time 5 2>/dev/null)
-            if [ "$HTTP" != "200" ]; then
-              echo "WARNING: proxy health returned $HTTP"
-            fi
-            echo "Keepalive: ${REMAINING}min remaining - $(date -u '+%H:%M:%S UTC')"
-            sleep 300
-          done
-
-      - name: Final report
-        if: always()
-        run: |
-          echo "========== FINAL REPORT =========="
-          echo "Tunnel : ${{ env.CLOUDFLARE_URL || '(not available)' }}"
-          echo "--- Ollama models ---"
-          curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" \
-            2>/dev/null | jq . || echo "Ollama unreachable"
-          echo "--- proxy.log (last 20) ---"
-          tail -20 proxy.log  2>/dev/null || echo "(none)"
-          echo "--- ollama.log (last 30) ---"
-          tail -30 ollama.log 2>/dev/null || echo "(none)"
-          echo "--- tunnel.log (last 10) ---"
-          tail -10 tunnel.log 2>/dev/null || echo "(none)"
-
-      - name: Cleanup
-        if: always()
-        run: |
-          [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
-          [ -f proxy.pid  ] && kill -9 "$(cat proxy.pid)"  2>/dev/null || true
-          [ -f ollama.pid ] && kill -9 "$(cat ollama.pid)" 2>/dev/null || true
-          pkill -9 -f cloudflared 2>/dev/null || true
-          pkill -9 -f ollama      2>/dev/null || true
-          sudo fuser -k "$PROXY_PORT/tcp"  2>/dev/null || true
-          sudo fuser -k "$OLLAMA_PORT/tcp" 2>/dev/null || true
-          rm -f ./*.pid
-          echo "Done."
+if __name__ == '__main__':
+    logger.info(f"🚀 Starting interceptor proxy on port {PROXY_PORT}")
+    logger.info(f"   → Ollama: {OLLAMA_HOST}:{OLLAMA_PORT}")
+    logger.info(f"   → Model: {MODEL}")
+    logger.info(f"   → Context: {CTX_SIZE}, Temperature: {TEMPERATURE}")
+    
+    # Run with threaded=True for better concurrency
+    app.run(host='0.0.0.0', port=PROXY_PORT, threaded=True)
