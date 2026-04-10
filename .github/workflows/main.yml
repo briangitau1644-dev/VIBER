@@ -47,15 +47,14 @@ jobs:
 
       - name: Kill Any Stale Servers
         run: |
-          echo "Killing any stale servers from previous runs..."
-          pkill -9 -f llama-server  2>/dev/null || true
-          pkill -9 -f llama-cpp     2>/dev/null || true
-          pkill -9 -f cloudflared   2>/dev/null || true
-          pkill -9 -f proxy.py      2>/dev/null || true
-          sudo fuser -k 1234/tcp    2>/dev/null || true
-          sudo fuser -k 11434/tcp   2>/dev/null || true
+          echo "Killing any stale servers..."
+          pkill -9 -f llama-server 2>/dev/null || true
+          pkill -9 -f cloudflared  2>/dev/null || true
+          pkill -9 -f proxy.py     2>/dev/null || true
+          sudo fuser -k 1234/tcp   2>/dev/null || true
+          sudo fuser -k 11434/tcp  2>/dev/null || true
           sleep 2
-          echo "OK: Ports 1234 and 11434 are free."
+          echo "OK: Ports clear."
 
       - name: Install Dependencies
         run: |
@@ -120,32 +119,51 @@ jobs:
           python3 - << 'PYEOF'
           import textwrap, pathlib
 
-          prompt = (
-              "You are a Senior Software Developer with 15 years of experience "
-              "across the full stack and every major programming language including "
-              "Python, JavaScript, TypeScript, Go, Rust, C, C++, Java, Kotlin, "
-              "Swift, PHP, Ruby, Bash, SQL, and GraphQL. "
-              "You build frontends with React, Vue, Svelte, and HTML/CSS. "
+          # ── Gemma 4 does not honour the system role.
+          # ── We prepend a user→model exchange that establishes the persona
+          # ── before the real conversation starts. This is the correct way
+          # ── to prime instruction-tuned Gemma models.
+
+          PRIMER_USER = (
+              "Before we start, I want to set some ground rules for how you should behave. "
+              "You are a Senior Software Developer with 15 years of experience across the "
+              "full stack and every major programming language including Python, JavaScript, "
+              "TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, Ruby, Bash, SQL, "
+              "and GraphQL. You build frontends with React, Vue, Svelte, and HTML/CSS. "
               "You build backends with REST APIs, gRPC, microservices, and serverless. "
-              "You work with databases including PostgreSQL, MySQL, SQLite, MongoDB, "
-              "Redis, and Cassandra. "
-              "You work with cloud platforms including AWS, GCP, and Azure. "
-              "You are running inside a coding assistant called Continue or Roo Code. "
-              "You have access to these tools: read_file, write_file, "
-              "create_directory, list_directory, execute_command, search_files, "
-              "and web_search. "
-              "Use these tools automatically whenever the task needs them. "
-              "When the user is chatting or planning, talk naturally like a "
-              "colleague. When coding, write complete working code with no "
-              "placeholders. Always include error handling. Be direct and honest."
+              "You work with databases including PostgreSQL, MySQL, SQLite, MongoDB, Redis, "
+              "and Cassandra. You work on cloud platforms including AWS, GCP, and Azure. "
+              "You are running inside a coding assistant called Continue or Roo Code and "
+              "have access to tools: read_file, write_file, create_directory, "
+              "list_directory, execute_command, search_files, and web_search. "
+              "Use these tools automatically whenever the task needs them without being asked. "
+              "When the user is chatting or planning, talk naturally like a colleague. "
+              "When coding, always write complete working code with no placeholders. "
+              "Always include proper error handling. Be direct and honest. "
+              "Do NOT introduce yourself as Gemma or mention Google DeepMind. "
+              "You are simply a senior developer assistant. "
+              "Please confirm you understand these instructions."
           )
-          pathlib.Path("/tmp/sysprompt.txt").write_text(prompt)
+
+          PRIMER_MODEL = (
+              "Understood. I am a Senior Software Developer assistant. "
+              "I will write complete, production-ready code in any language you need, "
+              "use my available tools proactively, and talk naturally when we are just "
+              "chatting or planning. What would you like to work on today?"
+          )
+
+          pathlib.Path("/tmp/primer_user.txt").write_text(PRIMER_USER)
+          pathlib.Path("/tmp/primer_model.txt").write_text(PRIMER_MODEL)
 
           proxy = textwrap.dedent('''
               import http.server, urllib.request, urllib.error, json, os
 
               BACKEND = "http://127.0.0.1:11434"
-              PROMPT = open("/tmp/sysprompt.txt").read().strip()
+
+              PRIMER = [
+                  {"role": "user",      "content": open("/tmp/primer_user.txt").read().strip()},
+                  {"role": "assistant", "content": open("/tmp/primer_model.txt").read().strip()},
+              ]
 
               class P(http.server.BaseHTTPRequestHandler):
                   def log_message(self, *a): pass
@@ -156,7 +174,8 @@ jobs:
                            if k.lower() not in ("host", "content-length")}
                       if body is not None:
                           h["Content-Length"] = str(len(body))
-                      req = urllib.request.Request(url, data=body, headers=h, method=self.command)
+                      req = urllib.request.Request(
+                          url, data=body, headers=h, method=self.command)
                       try:
                           r = urllib.request.urlopen(req, timeout=600)
                           st, rh, rb = r.status, r.headers, r.read()
@@ -179,9 +198,20 @@ jobs:
                           try:
                               p = json.loads(raw)
                               msgs = p.get("messages", [])
-                              if not msgs or msgs[0].get("role") != "system":
-                                  msgs.insert(0, {"role": "system", "content": PROMPT})
-                                  p["messages"] = msgs
+
+                              # Strip any system message - Gemma ignores it anyway
+                              msgs = [m for m in msgs if m.get("role") != "system"]
+
+                              # Prepend primer only if not already there
+                              already_primed = (
+                                  len(msgs) >= 2
+                                  and msgs[0].get("role") == "user"
+                                  and "ground rules" in msgs[0].get("content", "")
+                              )
+                              if not already_primed:
+                                  msgs = PRIMER + msgs
+
+                              p["messages"] = msgs
                               raw = json.dumps(p).encode()
                           except Exception:
                               pass
@@ -192,8 +222,9 @@ jobs:
               print(f"Proxy :{port} -> {BACKEND}", flush=True)
               srv.serve_forever()
           ''').lstrip()
+
           pathlib.Path("/tmp/proxy.py").write_text(proxy)
-          print("OK: proxy.py and sysprompt.txt written.")
+          print("OK: proxy.py written with Gemma 4 user/model primer.")
           PYEOF
 
       - name: Start llama-server
@@ -205,7 +236,7 @@ jobs:
             --port "$BACKEND_PORT" \
             --ctx-size "$CTX_SIZE" \
             --n-gpu-layers 0 \
-            --chat-template gemma \
+            --chat-template gemma3 \
             --temp "$TEMPERATURE" \
             --top-p 0.95 \
             --top-k 64 \
@@ -232,7 +263,7 @@ jobs:
 
       - name: Start Proxy
         run: |
-          echo "Starting system-prompt proxy on port $SERVER_PORT..."
+          echo "Starting proxy on port $SERVER_PORT..."
           PROXY_PORT=$SERVER_PORT nohup python3 /tmp/proxy.py > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 3
@@ -244,22 +275,24 @@ jobs:
             exit 1
           fi
 
-      - name: Verify System Prompt Is Being Injected
+      - name: Verify Persona Is Active
         run: |
-          echo "Verifying system prompt injection via proxy..."
+          echo "Verifying model persona..."
           RESP=$(curl -sf "http://127.0.0.1:$SERVER_PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Who are you and what is your job?\"}],\"max_tokens\":120,\"temperature\":0.1}" \
+            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Who are you and what can you help me with?\"}],\"max_tokens\":150,\"temperature\":0.1}" \
             2>/dev/null)
           CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null)
-          echo "Model replied: $CONTENT"
+          echo "---------- Model response ----------"
+          echo "$CONTENT"
+          echo "------------------------------------"
           if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ]; then
-            echo "ERROR: No response from model - check server.log and proxy.log"
-            cat server.log | tail -20
-            cat proxy.log  | tail -10
+            echo "ERROR: Empty response - check logs."
+            tail -20 server.log
+            tail -10 proxy.log
             exit 1
           fi
-          echo "OK: System prompt injection confirmed."
+          echo "OK: Model is responding."
 
       - name: Start Cloudflare Tunnel
         run: |
@@ -306,10 +339,10 @@ jobs:
           echo "   API Key  : any non-empty string"
           echo "=================================================="
 
-      - name: Smoke Test - Code
+      - name: Smoke Test
         if: env.CLOUDFLARE_URL != ''
         run: |
-          echo "--- Test: write a Python counting script ---"
+          echo "--- Smoke test: count 1 to 10 in Python ---"
           curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python script that counts from 1 to 10 and prints each number.\"}],\"max_tokens\":200,\"temperature\":0.1}" \
