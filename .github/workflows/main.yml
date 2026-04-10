@@ -5,11 +5,9 @@ on:
   workflow_dispatch:
 
 env:
-  # Using Node 24 for future-proofing GitHub Actions
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   
-  # === MODEL CONFIGURATION (UPDATED) ===
-  # Exact model URL as provided by user
+  # === MODEL CONFIGURATION ===
   MODEL_URL: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-bf16.gguf?download=true'
   MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
   MODEL_FILENAME: 'google_gemma-4-E4B-it-bf16.gguf'
@@ -27,7 +25,6 @@ jobs:
     name: Gemma4-E4B Full-Stack Senior Engineer
     runs-on: ubuntu-latest
     timeout-minutes: 400
-    # Prevent concurrent runs to avoid port conflicts
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
@@ -38,35 +35,23 @@ jobs:
 
       - name: Clean environment and ports
         run: |
-          # Kill any existing processes
           pkill -9 -f llama-server 2>/dev/null || true
           pkill -9 -f proxy.py 2>/dev/null || true
           pkill -9 -f cloudflared 2>/dev/null || true
-          
-          # Free up ports
           sudo fuser -k ${{ env.SERVER_PORT }}/tcp 2>/dev/null || true
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp 2>/dev/null || true
-          
-          # Clean build artifacts for fresh compile
           rm -rf llama.cpp build models cloudflared proxy.py
 
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            curl \
-            wget \
-            cmake \
-            build-essential \
-            python3 \
-            python3-pip \
-            git \
-            libcurl4-openssl-dev \
-            libssl-dev
+            curl wget cmake build-essential python3 python3-pip git \
+            libcurl4-openssl-dev libssl-dev
 
       - name: Build latest llama.cpp from source
         run: |
-          echo "🔧 Cloning llama.cpp from ${LLAMA_REPO}..."
+          echo "🔧 Cloning llama.cpp..."
           git clone --depth 1 --branch "${LLAMA_BRANCH}" "${LLAMA_REPO}"
           cd llama.cpp
           
@@ -77,54 +62,39 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_NATIVE=OFF
           
-          echo "⚙️ Building llama-server (this may take 10-20 minutes)..."
+          echo "⚙️ Building llama-server..."
           cmake --build build --config Release -j$(nproc)
           
-          # Locate the llama-server binary reliably
           SERVER_BIN=$(find build -name "llama-server" -type f -executable | head -n 1)
           if [ -z "$SERVER_BIN" ]; then
             echo "❌ ERROR: llama-server binary not found!"
             exit 1
           fi
           
-          echo "✅ Found llama-server at: $(realpath $SERVER_BIN)"
           echo "SERVER_BIN=$(realpath $SERVER_BIN)" >> $GITHUB_ENV
-          
-          # Verify binary works
-          $SERVER_BIN --help | head -5
+          $SERVER_BIN --help | head -3
 
       - name: Download Gemma-4 BF16 GGUF model
         run: |
           mkdir -p models
-          echo "📦 Downloading BF16 GGUF model (large file ~15GB)..."
-          echo "   URL: ${MODEL_URL}"
-          echo "   Destination: ${MODEL_PATH}"
-          echo "   ⚠️  This may take 10-30 minutes depending on bandwidth"
+          echo "📦 Downloading BF16 model (~15GB)..."
           
-          # Download with retry logic, progress, and timeout for large file
           curl -fL --retry 3 --retry-delay 15 --connect-timeout 30 --max-time 1800 \
             -o "${MODEL_PATH}" \
             "${MODEL_URL}"
           
-          # Verify download succeeded
           if [ ! -f "${MODEL_PATH}" ]; then
             echo "❌ ERROR: Model download failed!"
             exit 1
           fi
           
-          # Show file info
-          FILE_SIZE=$(stat -c%s "${MODEL_PATH}" 2>/dev/null || stat -f%z "${MODEL_PATH}" 2>/dev/null)
-          echo "✅ Model downloaded successfully"
-          echo "   File: ${MODEL_FILENAME}"
-          echo "   Size: $(numfmt --to=iec-i --suffix=B ${FILE_SIZE} 2>/dev/null || echo "${FILE_SIZE} bytes")"
-          echo "   Path: $(realpath ${MODEL_PATH})"
+          FILE_SIZE=$(stat -c%s "${MODEL_PATH}" 2>/dev/null || echo "unknown")
+          echo "✅ Model downloaded: ${MODEL_FILENAME} (${FILE_SIZE} bytes)"
 
       - name: Start llama-server with OpenAI-compatible API
         run: |
-          echo "🚀 Starting llama-server with BF16 model..."
+          echo "🚀 Starting llama-server..."
           
-          # Start server in background with flags optimized for CPU inference
-          # BF16 models require more RAM but offer higher precision
           $SERVER_BIN \
             --model "${MODEL_PATH}" \
             --port ${{ env.SERVER_PORT }} \
@@ -138,124 +108,176 @@ jobs:
             &
           
           SERVER_PID=$!
-          echo "llama-server PID: $SERVER_PID"
           echo "SERVER_PID=${SERVER_PID}" >> $GITHUB_ENV
           
-          # Health check loop with proper endpoint handling
-          echo "⏳ Waiting for server to initialize (max 120 seconds for BF16 load)..."
-          for i in {1..24}; do
+          echo "⏳ Waiting for server initialization..."
+          for i in {1..30}; do
             if curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" | grep -qE '"status"|"ok"'; then
-              echo "✅ Server is UP and healthy!"
-              curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" | head -c 200 || true
-              echo ""
+              echo "✅ Server is UP!"
               break
             fi
-            if [ $i -eq 24 ]; then
-              echo "❌ ERROR: Server failed to start within timeout"
-              echo "📋 Last 20 lines of workflow log:"
-              exit 1
-            fi
-            echo "   Waiting for model load... ($i/24)"
+            [ $i -eq 30 ] && { echo "❌ Server failed to start"; exit 1; }
+            echo "   Waiting... ($i/30)"
             sleep 5
           done
 
-      - name: Start Ollama-compatible proxy wrapper
+      - name: Start Ollama-compatible proxy wrapper (FIXED: GET support)
         run: |
-          echo "🔗 Creating Ollama-style proxy on port ${{ env.PROXY_PORT }}..."
+          echo "🔗 Creating proxy with full HTTP method support..."
           
           cat << 'PYEOF' > proxy.py
           #!/usr/bin/env python3
           """
-          Ollama-compatible proxy for llama-server OpenAI API
-          Injects senior engineer system prompt for production-ready responses
+          Ollama-compatible proxy for llama-server with full HTTP method support
+          Fixes: 501 Unsupported method ('GET') error
           """
           import http.server
           import urllib.request
+          import urllib.parse
           import json
           import os
           import sys
 
-          # Configuration from environment
           SERVER_PORT = os.environ.get('SERVER_PORT', '8080')
           PROXY_PORT = int(os.environ.get('PROXY_PORT', '11434'))
+          BACKEND_URL = f"http://localhost:{SERVER_PORT}"
           
-          # Senior Engineer persona - injected as system prompt
           SYSTEM_PROMPT = (
               "You are a Senior Full-Stack Engineer with 15+ years of experience. "
               "Expert in Python, Django, FastAPI, React, TypeScript, Node.js, and System Design. "
               "Respond with complete, clean, production-ready code following best practices. "
               "Include proper error handling, type hints, and documentation. "
-              "No explanations unless explicitly asked. No placeholders or TODOs. "
-              "Use modern Python 3.11+ and ES2022+ syntax. "
-              "Prioritize security, performance, and maintainability."
+              "No explanations unless explicitly asked. No placeholders or TODOs."
           )
 
           class ProxyHandler(http.server.BaseHTTPRequestHandler):
               protocol_version = 'HTTP/1.1'
               
               def log_message(self, format, *args):
-                  # Suppress verbose logs in CI environment
                   if os.environ.get('DEBUG_PROXY'):
                       print(f"[PROXY] {args[0]}", file=sys.stderr)
                   pass
 
               def _send_cors_headers(self):
                   self.send_header("Access-Control-Allow-Origin", "*")
-                  self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                  self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                   self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept")
+
+              def _forward_request(self, method, path, body=None):
+                  """Forward request to llama-server backend"""
+                  target_url = f"{BACKEND_URL}{path}"
+                  headers = {
+                      "Content-Type": "application/json",
+                      "Accept": "application/json"
+                  }
+                  
+                  data = body.encode('utf-8') if body else None
+                  if data:
+                      headers["Content-Length"] = str(len(data))
+                  
+                  req = urllib.request.Request(target_url, data=data, headers=headers, method=method)
+                  
+                  with urllib.request.urlopen(req, timeout=180) as response:
+                      return response.getcode(), response.read(), dict(response.headers)
+
+              def _send_response(self, code, body, headers=None):
+                  """Send HTTP response to client"""
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", len(body))
+                  if headers:
+                      for k, v in headers.items():
+                          if k.lower() not in ['content-type', 'content-length', 'transfer-encoding']:
+                              self.send_header(k, v)
+                  self._send_cors_headers()
+                  self.end_headers()
+                  self.wfile.write(body)
 
               def do_OPTIONS(self):
                   self.send_response(200)
                   self._send_cors_headers()
                   self.end_headers()
 
+              def do_GET(self):
+                  """Handle GET requests - FIXES 501 error"""
+                  parsed = urllib.parse.urlparse(self.path)
+                  path = parsed.path
+                  
+                  # Handle proxy-specific endpoints
+                  if path == '/' or path == '/health':
+                      # Return proxy health status
+                      response = json.dumps({
+                          "status": "ok",
+                          "proxy": "running",
+                          "backend": f"http://localhost:{SERVER_PORT}",
+                          "model": "google_gemma-4-E4B-it-bf16"
+                      })
+                      self._send_response(200, response.encode())
+                      return
+                  
+                  if path == '/api/tags' or path == '/v1/models':
+                      # Return model info for Ollama/OpenAI compatibility
+                      response = json.dumps({
+                          "models": [{
+                              "id": "gemma-4-bf16",
+                              "name": "Gemma 4 E4B BF16",
+                              "object": "model",
+                              "created": 1704067200,
+                              "owned_by": "google"
+                          }]
+                      })
+                      self._send_response(200, response.encode())
+                      return
+                  
+                  # Forward other GET requests to backend llama-server
+                  try:
+                      code, body, resp_headers = self._forward_request('GET', path)
+                      self._send_response(code, body, resp_headers)
+                  except urllib.error.HTTPError as e:
+                      self._send_response(e.code, e.read())
+                  except Exception as e:
+                      self._send_response(500, json.dumps({"error": str(e)}).encode())
+
               def do_POST(self):
+                  """Handle POST requests with system prompt injection"""
                   try:
                       content_length = int(self.headers.get('Content-Length', 0))
                       body = self.rfile.read(content_length)
                       data = json.loads(body) if body else {}
                       
-                      # Inject system prompt for Ollama-style /api/chat endpoint
+                      # Inject system prompt for chat endpoints
                       if "messages" in data and not any(m.get("role") == "system" for m in data["messages"]):
                           data["messages"].insert(0, {"role": "system", "content": SYSTEM_PROMPT})
                       
-                      # Forward to llama-server OpenAI-compatible endpoint
-                      target_url = f"http://localhost:{SERVER_PORT}/v1/chat/completions"
-                      req = urllib.request.Request(
-                          target_url,
-                          data=json.dumps(data).encode('utf-8'),
-                          headers={
-                              "Content-Type": "application/json",
-                              "Accept": "application/json"
-                          },
-                          method='POST'
+                      # Forward to backend
+                      code, response_body, resp_headers = self._forward_request(
+                          'POST', self.path, json.dumps(data)
                       )
+                      self._send_response(code, response_body, resp_headers)
                       
-                      with urllib.request.urlopen(req, timeout=180) as response:
-                          response_body = response.read()
-                          self.send_response(response.getcode())
-                          self.send_header("Content-Type", "application/json")
-                          self.send_header("Content-Length", len(response_body))
-                          self._send_cors_headers()
-                          self.end_headers()
-                          self.wfile.write(response_body)
-                          
                   except urllib.error.HTTPError as e:
-                      self.send_response(e.code)
-                      self.send_header("Content-Type", "application/json")
-                      self._send_cors_headers()
-                      self.end_headers()
-                      self.wfile.write(e.read())
+                      self._send_response(e.code, e.read())
+                  except json.JSONDecodeError:
+                      self._send_response(400, json.dumps({"error": "Invalid JSON"}).encode())
                   except Exception as e:
-                      self.send_response(500)
-                      self.send_header("Content-Type", "application/json")
+                      self._send_response(500, json.dumps({"error": str(e)}).encode())
+
+              def do_HEAD(self):
+                  """Handle HEAD requests"""
+                  try:
+                      code, _, resp_headers = self._forward_request('HEAD', self.path)
+                      self.send_response(code)
+                      for k, v in resp_headers.items():
+                          self.send_header(k, v)
                       self._send_cors_headers()
                       self.end_headers()
-                      error_response = json.dumps({"error": str(e)})
-                      self.wfile.write(error_response.encode())
+                  except:
+                      self.send_response(500)
+                      self.end_headers()
 
           if __name__ == "__main__":
-              print(f"🔗 Proxy starting on 0.0.0.0:{PROXY_PORT} → localhost:{SERVER_PORT}")
+              print(f"🔗 Proxy starting on 0.0.0.0:{PROXY_PORT} → {BACKEND_URL}")
+              print(f"✅ Supported methods: GET, POST, HEAD, OPTIONS")
               http.server.HTTPServer(('0.0.0.0', PROXY_PORT), ProxyHandler).serve_forever()
           PYEOF
           
@@ -268,82 +290,64 @@ jobs:
 
       - name: Download and start cloudflared tunnel
         run: |
-          echo "🌐 Setting up Cloudflare Tunnel for public access..."
+          echo "🌐 Setting up Cloudflare Tunnel..."
           
-          # Download latest cloudflared Linux AMD64 binary
           curl -fL --retry 3 -o cloudflared \
             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
           
           chmod +x cloudflared
-          ./cloudflared --version
           
-          # Start tunnel in background pointing to proxy port
-          ./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate &
+          # Start tunnel and capture output
+          ./cloudflared tunnel --url "http://localhost:${{ env.PROXY_PORT }}" --no-autoupdate > tunnel.log 2>&1 &
           TUNNEL_PID=$!
           echo "TUNNEL_PID=${TUNNEL_PID}" >> $GITHUB_ENV
           
-          # Wait for tunnel to establish and extract public URL
-          echo "⏳ Waiting for tunnel to connect (max 45 seconds)..."
+          echo "⏳ Waiting for tunnel connection..."
           PUBLIC_URL=""
-          for i in {1..15}; do
-            PUBLIC_URL=$(curl -sf "http://localhost:45678/metrics" 2>/dev/null | \
-              grep -oP 'https://[a-z0-9.-]+\.trycloudflare\.com' | head -n1) || true
-            
-            if [ -n "$PUBLIC_URL" ]; then
-              echo "✅ Tunnel connected!"
-              break
+          for i in {1..20}; do
+            if [ -f tunnel.log ]; then
+              PUBLIC_URL=$(grep -oP 'https://[a-z0-9.-]+\.trycloudflare\.com' tunnel.log | head -n1) || true
             fi
-            sleep 3
+            [ -n "$PUBLIC_URL" ] && break
+            sleep 2
           done
           
           if [ -n "$PUBLIC_URL" ]; then
             echo ""
-            echo "╔════════════════════════════════════════════════════════╗"
-            echo "║  🎉 Your Gemma-4 BF16 Senior Engineer API is live!    ║"
-            echo "╠════════════════════════════════════════════════════════╣"
-            echo "║  Public URL: ${PUBLIC_URL}║"
-            echo "║  Endpoint: ${PUBLIC_URL}/v1/chat/completions          ║"
-            echo "║  Ollama-compatible: ${PUBLIC_URL}/api/chat              ║"
-            echo "║  Model: google_gemma-4-E4B-it-bf16.gguf (BF16)        ║"
-            echo "╚════════════════════════════════════════════════════════╝"
+            echo "╔════════════════════════════════════════════════════╗"
+            echo "║  🎉 Gemma-4 BF16 API is live!                     ║"
+            echo "╠════════════════════════════════════════════════════╣"
+            echo "║  URL: ${PUBLIC_URL}║"
+            echo "║  Chat: ${PUBLIC_URL}/v1/chat/completions          ║"
+            echo "║  Ollama: ${PUBLIC_URL}/api/chat                   ║"
+            echo "║  Health: ${PUBLIC_URL}/health                     ║"
+            echo "╚════════════════════════════════════════════════════╝"
             echo ""
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_ENV
             echo "PUBLIC_URL=${PUBLIC_URL}" >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️  Warning: Could not determine public URL"
-            echo "Check the workflow logs for cloudflared output"
+            echo "⚠️  Could not detect public URL - check tunnel.log"
+            cat tunnel.log 2>/dev/null || true
           fi
 
       - name: Display usage examples
         if: env.PUBLIC_URL
         run: |
-          echo "📋 Example API calls:"
+          echo "📋 Test your API:"
           echo ""
-          echo "# OpenAI-compatible chat completion:"
+          echo "# Health check (GET - now fixed!):"
+          echo "curl ${PUBLIC_URL}/health"
+          echo ""
+          echo "# Chat completion:"
           echo "curl -X POST ${PUBLIC_URL}/v1/chat/completions \\"
           echo "  -H 'Content-Type: application/json' \\"
-          echo "  -d '{\"model\": \"gemma-4-bf16\", \"messages\": [{\"role\": \"user\", \"content\": \"Write a Python function to validate email addresses\"}]}'"
-          echo ""
-          echo "# Ollama-compatible chat:"
-          echo "curl -X POST ${PUBLIC_URL}/api/chat \\"
-          echo "  -H 'Content-Type: application/json' \\"
-          echo "  -d '{\"model\": \"gemma-4-bf16\", \"messages\": [{\"role\": \"user\", \"content\": \"Create a React hook for API calls\"}]}'"
-          echo ""
-          echo "# Health check:"
-          echo "curl ${PUBLIC_URL}/health"
+          echo "  -d '{\"model\":\"gemma-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python email validator\"}]}'"
 
       - name: Keep workflow alive
         run: |
-          echo "⏱️  Keeping tunnel alive for 6 hours (max GitHub Actions runtime)..."
-          echo "💡 Tip: Use the PUBLIC_URL from workflow output to access your API"
-          echo "⚠️  Note: BF16 model inference on CPU will be slower than quantized versions"
-          
-          # Keep processes alive and monitor health
-          for i in {1..720}; do  # 720 * 30s = 6 hours
-            # Check if server is still responding
-            if ! curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" >/dev/null 2>&1; then
-              echo "⚠️  Server health check failed at iteration $i"
-            fi
+          echo "⏱️  Keeping tunnel alive (6 hours max)..."
+          for i in {1..720}; do
+            curl -sf "http://localhost:${{ env.SERVER_PORT }}/health" >/dev/null 2>&1 || \
+              echo "⚠️  Backend health check failed at $i"
             sleep 30
           done
-          echo "✅ Workflow completed successfully"
