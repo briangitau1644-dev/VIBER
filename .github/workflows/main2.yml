@@ -17,21 +17,25 @@ on:
         default: '0.2'
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
   CTX_SIZE: ${{ github.event.inputs.ctx_size || '8192' }}
   TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
   OLLAMA_PORT: '11434'
   PROXY_PORT: '1234'
-  MODEL: 'gemma4:e4b'  # ONLY THIS MODEL
+  MODEL: 'gemma4:e4b'
 
 jobs:
-  senior-engineer-ollama-gemma4:
-    name: gemma4:e4b via Ollama
+  deploy-gemma4-proxy:
+    name: gemma4:e4b via Ollama + Proxy
     runs-on: ubuntu-latest
     timeout-minutes: 400
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Kill stale processes
         run: |
@@ -43,24 +47,35 @@ jobs:
           sleep 2
           echo "✅ Ports cleared"
 
-      - name: Install deps
+      - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq curl wget jq python3
-          python3 --version
+          sudo apt-get install -y -qq curl wget jq python3 python3-pip
+          pip3 install --quiet flask requests
+          echo "Python $(python3 --version) | Flask installed"
 
       - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
 
-      - name: Start Ollama
+      - name: Start Ollama server
         run: |
-          OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 nohup ollama serve > ollama.log 2>&1 &
+          OLLAMA_HOST=0.0.0.0:$OLLAMA_PORT \
+          OLLAMA_KEEP_ALIVE=-1 \
+          OLLAMA_NUM_PARALLEL=1 \
+          nohup ollama serve > ollama.log 2>&1 &
           echo "⏳ Waiting for Ollama API..."
-          for i in $(seq 1 120); do  # Extended wait
-            curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1 && { echo "✅ Ollama ready"; break; }
-            [ "$i" -eq 120 ] && { echo "❌ Ollama timeout"; cat ollama.log; exit 1; }
+          for i in $(seq 1 120); do
+            if curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/tags" > /dev/null 2>&1; then
+              echo "✅ Ollama ready after $((i*2))s"
+              break
+            fi
+            if [ "$i" -eq 120 ]; then
+              echo "❌ ERROR: Ollama failed to start"
+              cat ollama.log
+              exit 1
+            fi
             sleep 2
           done
 
@@ -70,117 +85,138 @@ jobs:
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull "$MODEL"
           echo "✅ Pull complete"
 
-      - name: Verify model exists
+      - name: Verify model loaded
         run: |
-          echo "🔍 Verifying $MODEL is loaded..."
+          echo "🔍 Verifying $MODEL is available..."
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
           if ! OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list | grep -q "^$MODEL"; then
             echo "❌ FATAL: $MODEL not found after pull!"
-            echo "Available models:"
-            OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama list
             exit 1
           fi
           echo "✅ $MODEL confirmed"
 
-      - name: Warm up gemma4:e4b
+      - name: Warm up model
         run: |
-          echo "🔥 Warming up $MODEL (extended timeout)..."
-          # Use longer timeout for large model initialization
+          echo "🔥 Warming up $MODEL (extended timeout for VRAM loading)..."
           curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/chat" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":3}}" \
-            --max-time 300 > /dev/null  # 5 minute timeout for warmup
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":5}}" \
+            --max-time 300 > /dev/null
           echo "✅ Warmup complete"
 
-      - name: Start Proxy
+      - name: Start interceptor proxy
         run: |
+          if [ ! -f "interceptor.py" ]; then
+            echo "❌ ERROR: interceptor.py not found in repository root!"
+            echo "Please commit the Flask-based interceptor.py before running this workflow."
+            exit 1
+          fi
+
           python3 interceptor.py > proxy.log 2>&1 &
           echo $! > proxy.pid
-          sleep 3  # Give proxy time to bind
-          
+          sleep 3
+
           if ! kill -0 $(cat proxy.pid) 2>/dev/null; then
-            echo "❌ Proxy crashed on startup"
+            echo "❌ Proxy crashed on startup!"
             cat proxy.log
             exit 1
           fi
           echo "✅ Proxy alive (PID: $(cat proxy.pid))"
-          
-          echo "⏳ Health check..."
+
+          echo "⏳ Waiting for proxy health endpoint..."
           for i in $(seq 1 20); do
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PROXY_PORT/health" --max-time 5 2>/dev/null)
-            [ "$HTTP" = "200" ] && { echo "✅ Proxy healthy"; break; }
-            [ "$i" -eq 20 ] && { echo "❌ Health failed (HTTP $HTTP)"; cat proxy.log; exit 1; }
+            if [ "$HTTP" = "200" ]; then
+              echo "✅ Proxy healthy on :$PROXY_PORT"
+              break
+            fi
+            if [ "$i" -eq 20 ]; then
+              echo "❌ Health check failed (HTTP $HTTP)"
+              cat proxy.log
+              exit 1
+            fi
             sleep 1
           done
 
-      - name: Test Direct Ollama (bypass proxy)
+      - name: Verify end-to-end through proxy
         run: |
-          echo "🧪 Testing $MODEL directly via Ollama API..."
-          RESP=$(curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/chat" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: TEST_OK\"}],\"stream\":false,\"options\":{\"num_predict\":10}}" \
-            --max-time 120)
-          echo "Direct Ollama response: $RESP"
-          CONTENT=$(echo "$RESP" | jq -r '.message.content // empty' 2>/dev/null)
-          echo "Direct content: '$CONTENT'"
-          if [ -z "$CONTENT" ]; then
-            echo "⚠️ Direct Ollama also returned empty - model may need more time or different params"
-          else
-            echo "✅ Direct Ollama works"
-          fi
-
-      - name: Verify End-to-End via Proxy
-        run: |
-          echo "🔄 Testing through proxy..."
+          echo "🔄 Testing proxy endpoint..."
           RESP=$(curl -sf "http://127.0.0.1:$PROXY_PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply: ready\"}],\"max_tokens\":10}" \
+            -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply: OK\"}],\"max_tokens\":10}" \
             --max-time 120)
-          echo "Proxy raw response: $RESP"
+          
           CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
-          echo "Proxy content: '$CONTENT'"
-          # Don't fail on empty - just log; the verbose proxy.log will show why
+          echo "Proxy response: $CONTENT"
+          
           if [ -z "$CONTENT" ]; then
-            echo "⚠️ Proxy returned empty - check proxy.log for Ollama response details"
+            echo "⚠️ Empty content returned. Check proxy.log for Ollama response details."
+            tail -50 proxy.log
           else
-            echo "✅ Proxy end-to-end OK"
+            echo "✅ End-to-end proxy test passed"
           fi
 
-      - name: Cloudflare Tunnel
+      - name: Install and start Cloudflare tunnel
         run: |
           curl -fsSL -o /tmp/cf.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb"
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-          nohup cloudflared tunnel --url "http://127.0.0.1:$PROXY_PORT" --no-autoupdate > tunnel.log 2>&1 &
-          echo $! > tunnel.pid
           
-          URL=""
-          for i in $(seq 1 60); do  # Extended tunnel wait
-            URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
-            [ -n "$URL" ] && break; sleep 2
-          done
-          [ -z "$URL" ] && { echo "❌ No tunnel"; cat tunnel.log; exit 1; }
-          echo "CLOUDFLARE_URL=${URL%/}" >> $GITHUB_ENV
-          echo "✅ Tunnel: $URL"
+          nohup cloudflared tunnel \
+            --url "http://127.0.0.1:$PROXY_PORT" \
+            --no-autoupdate \
+            --loglevel info \
+            > tunnel.log 2>&1 &
+          echo $! > tunnel.pid
 
-      - name: Keepalive
+          TUNNEL_URL=""
+          for i in $(seq 1 60); do
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1 || true)
+            [ -n "$TUNNEL_URL" ] && { TUNNEL_URL="${TUNNEL_URL%/}"; break; }
+            sleep 2
+          done
+
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "❌ ERROR: No tunnel URL found"
+            cat tunnel.log
+            exit 1
+          fi
+
+          echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
+          echo "✅ Tunnel URL: $TUNNEL_URL"
+
+      - name: Keepalive loop
         run: |
           END=$(( $(date +%s) + SESSION_HOURS * 3600 ))
+          echo "⏱️ Keepalive active for $SESSION_HOURS hours"
           while [ "$(date +%s)" -lt "$END" ]; do
             REM=$(( (END - $(date +%s)) / 60 ))
-            echo "💓 ${REM}min - $(date -u '+%H:%M UTC')"
+            echo "💓 ${REM}min remaining - $(date -u '+%H:%M:%S UTC')"
             sleep 300
           done
 
-      - name: Final Logs
+      - name: Final logs
         if: always()
         run: |
-          echo "📋 proxy.log (last 50 lines):"
+          echo "========== FINAL REPORT =========="
+          echo "Tunnel: ${{ env.CLOUDFLARE_URL || 'Not generated' }}"
+          echo "--- proxy.log (last 50) ---"
           tail -50 proxy.log 2>/dev/null || echo "(none)"
-          echo "📋 ollama.log (last 30):"
-          tail -30 ollama.log 2>/dev/null || echo "(none)"
+          echo "--- ollama.log (last 20) ---"
+          tail -20 ollama.log 2>/dev/null || echo "(none)"
+          echo "--- tunnel.log (last 10) ---"
+          tail -10 tunnel.log 2>/dev/null || echo "(none)"
 
-      - name: Cleanup
+      - name: Cleanup resources
         if: always()
         run: |
-          for f in proxy.pid ollama.pid tunnel.pid; do [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null || true; done
-          pkill -9 -f cloudflared 2>/dev/null || true; pkill -9 -f ollama 2>/dev/null || true
+          echo "🧹 Cleaning up..."
+          for f in proxy.pid ollama.pid tunnel.pid; do
+            [ -f "$f" ] && kill -9 "$(cat "$f")" 2>/dev/null || true
+          done
+          pkill -9 -f cloudflared 2>/dev/null || true
+          pkill -9 -f ollama 2>/dev/null || true
+          pkill -9 -f "python.*interceptor" 2>/dev/null || true
+          sudo fuser -k "$PROXY_PORT/tcp" 2>/dev/null || true
+          sudo fuser -k "$OLLAMA_PORT/tcp" 2>/dev/null || true
+          rm -f ./*.pid /tmp/cf.deb
+          echo "✅ Cleanup complete"
