@@ -15,24 +15,13 @@ on:
         description: 'Session duration (max 6)'
         required: false
         default: '6'
-      ctx_size:
-        description: 'Context size'
-        required: false
-        default: '8192'
-      temperature:
-        description: '0.1-0.3 for deterministic code'
-        required: false
-        default: '0.2'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL_FILENAME: ${{ github.event.inputs.model_filename || 'google_gemma-4-E4B-it-bf16.gguf' }}
-  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url || 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-bf16.gguf?download=true' }}
-  SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
-  CTX_SIZE: ${{ github.event.inputs.ctx_size || '8192' }}
-  TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
-  SERVER_PORT: '1234'
-  BACKEND_PORT: '11434'
+  MODEL_FILENAME: ${{ github.event.inputs.model_filename }}
+  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
+  SESSION_HOURS: ${{ github.event.inputs.session_hours }}
+  SERVER_PORT: '11434' # Using Ollama's default port for compatibility
   MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
 
 jobs:
@@ -47,348 +36,71 @@ jobs:
 
       - name: Kill Any Stale Servers
         run: |
-          echo "Killing any stale servers..."
           pkill -9 -f llama-server 2>/dev/null || true
           pkill -9 -f cloudflared  2>/dev/null || true
-          pkill -9 -f proxy.py     2>/dev/null || true
-          sudo fuser -k 1234/tcp   2>/dev/null || true
           sudo fuser -k 11434/tcp  2>/dev/null || true
-          sleep 2
-          echo "OK: Ports clear."
 
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            curl wget jq grep bash procps \
-            cmake build-essential git \
-            libcurl4-openssl-dev libssl-dev \
-            python3
+          sudo apt-get install -y -qq curl wget cmake build-essential python3
 
-      - name: Clone llama.cpp
+      - name: Clone and Build llama.cpp
         run: |
           git clone --depth 1 https://github.com/ggerganov/llama.cpp
-          cd llama.cpp && git log -1 --oneline
-
-      - name: Build llama-server
-        run: |
           cd llama.cpp
-          mkdir -p build && cd build
-          cmake .. \
-            -DLLAMA_CURL=ON \
-            -DLLAMA_BUILD_SERVER=ON \
-            -DLLAMA_BUILD_EXAMPLES=OFF \
-            -DLLAMA_BUILD_TESTS=OFF \
-            -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --config Release -j$(nproc)
-          SERVER_BIN=""
-          for bin in "./bin/llama-server" "./bin/server" "./llama-server" "./server"; do
-            [ -f "$bin" ] && SERVER_BIN="$(realpath $bin)" && break
-          done
-          if [ -z "$SERVER_BIN" ]; then
-            echo "ERROR: Server binary not found"
-            find . -name "*server*" -type f
-            exit 1
-          fi
-          echo "OK: $SERVER_BIN"
-          echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
+          cmake -B build -DLLAMA_CURL=ON -DLLAMA_BUILD_SERVER=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j$(nproc)
+          echo "SERVER_BIN=$(realpath build/bin/llama-server)" >> $GITHUB_ENV
 
       - name: Download Model
         run: |
           mkdir -p models
-          echo "Downloading $MODEL_FILENAME (~15 GB bf16, allow up to 30 min)..."
-          if ! curl -fL \
-              --retry 5 --retry-delay 10 \
-              --connect-timeout 60 --max-time 3600 \
-              -H "User-Agent: Mozilla/5.0" \
-              -o "$MODEL_PATH" \
-              "$MODEL_DOWNLOAD_URL"; then
-            echo "ERROR: Download failed."
-            exit 1
-          fi
-          BYTES=$(stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)
-          if [ "$BYTES" -lt 1048576 ]; then
-            echo "ERROR: File too small - likely an HTML error page."
-            head -c 500 "$MODEL_PATH"
-            exit 1
-          fi
-          echo "OK: $(du -h $MODEL_PATH | cut -f1) saved to $MODEL_PATH"
+          curl -fL -o "$MODEL_PATH" "$MODEL_DOWNLOAD_URL"
 
-      - name: Write Proxy Script
+      - name: Create Ollama-Style Persona & Template
         run: |
-          python3 - << 'PYEOF'
-          import textwrap, pathlib
+          # This replicates the 'Ollama Modelfile' behavior
+          cat << 'EOF' > /tmp/system_prompt.txt
+          You are a Senior Full-Stack Engineer (15+ years exp). 
+          Expert in Python (Django/FastAPI), JS (React/Next.js), Rust, and DevOps.
+          Your tone: Professional, direct, architectural.
+          Rule 1: Always provide complete, copy-pasteable code.
+          Rule 2: No preamble/chatting unless necessary.
+          Rule 3: Use markdown formatting.
+          EOF
 
-          # ── Gemma 4 does not honour the system role.
-          # ── We prepend a user→model exchange that establishes the persona
-          # ── before the real conversation starts. This is the correct way
-          # ── to prime instruction-tuned Gemma models.
-
-          PRIMER_USER = (
-              "Before we start, I want to set some ground rules for how you should behave. "
-              "You are a Senior Software Developer with 15 years of experience across the "
-              "full stack and every major programming language including Python, JavaScript, "
-              "TypeScript, Go, Rust, C, C++, Java, Kotlin, Swift, PHP, Ruby, Bash, SQL, "
-              "and GraphQL. You build frontends with React, Vue, Svelte, and HTML/CSS. "
-              "You build backends with REST APIs, gRPC, microservices, and serverless. "
-              "You work with databases including PostgreSQL, MySQL, SQLite, MongoDB, Redis, "
-              "and Cassandra. You work on cloud platforms including AWS, GCP, and Azure. "
-              "You are running inside a coding assistant called Continue or Roo Code and "
-              "have access to tools: read_file, write_file, create_directory, "
-              "list_directory, execute_command, search_files, and web_search. "
-              "Use these tools automatically whenever the task needs them without being asked. "
-              "When the user is chatting or planning, talk naturally like a colleague. "
-              "When coding, always write complete working code with no placeholders. "
-              "Always include proper error handling. Be direct and honest. "
-              "Do NOT introduce yourself as Gemma or mention Google DeepMind. "
-              "You are simply a senior developer assistant. "
-              "Please confirm you understand these instructions."
-          )
-
-          PRIMER_MODEL = (
-              "Understood. I am a Senior Software Developer assistant. "
-              "I will write complete, production-ready code in any language you need, "
-              "use my available tools proactively, and talk naturally when we are just "
-              "chatting or planning. What would you like to work on today?"
-          )
-
-          pathlib.Path("/tmp/primer_user.txt").write_text(PRIMER_USER)
-          pathlib.Path("/tmp/primer_model.txt").write_text(PRIMER_MODEL)
-
-          proxy = textwrap.dedent('''
-              import http.server, urllib.request, urllib.error, json, os
-
-              BACKEND = "http://127.0.0.1:11434"
-
-              PRIMER = [
-                  {"role": "user",      "content": open("/tmp/primer_user.txt").read().strip()},
-                  {"role": "assistant", "content": open("/tmp/primer_model.txt").read().strip()},
-              ]
-
-              class P(http.server.BaseHTTPRequestHandler):
-                  def log_message(self, *a): pass
-
-                  def _fwd(self, body=None):
-                      url = BACKEND + self.path
-                      h = {k: v for k, v in self.headers.items()
-                           if k.lower() not in ("host", "content-length")}
-                      if body is not None:
-                          h["Content-Length"] = str(len(body))
-                      req = urllib.request.Request(
-                          url, data=body, headers=h, method=self.command)
-                      try:
-                          r = urllib.request.urlopen(req, timeout=600)
-                          st, rh, rb = r.status, r.headers, r.read()
-                      except urllib.error.HTTPError as e:
-                          st, rh, rb = e.code, e.headers, e.read()
-                      self.send_response(st)
-                      for k, v in rh.items():
-                          if k.lower() != "transfer-encoding":
-                              self.send_header(k, v)
-                      self.end_headers()
-                      self.wfile.write(rb)
-
-                  def do_GET(self):    self._fwd()
-                  def do_DELETE(self): self._fwd()
-
-                  def do_POST(self):
-                      n = int(self.headers.get("Content-Length", 0))
-                      raw = self.rfile.read(n)
-                      if "/chat/completions" in self.path:
-                          try:
-                              p = json.loads(raw)
-                              msgs = p.get("messages", [])
-
-                              # Strip any system message - Gemma ignores it anyway
-                              msgs = [m for m in msgs if m.get("role") != "system"]
-
-                              # Prepend primer only if not already there
-                              already_primed = (
-                                  len(msgs) >= 2
-                                  and msgs[0].get("role") == "user"
-                                  and "ground rules" in msgs[0].get("content", "")
-                              )
-                              if not already_primed:
-                                  msgs = PRIMER + msgs
-
-                              p["messages"] = msgs
-                              raw = json.dumps(p).encode()
-                          except Exception:
-                              pass
-                      self._fwd(raw)
-
-              port = int(os.environ.get("PROXY_PORT", 1234))
-              srv = http.server.HTTPServer(("0.0.0.0", port), P)
-              print(f"Proxy :{port} -> {BACKEND}", flush=True)
-              srv.serve_forever()
-          ''').lstrip()
-
-          pathlib.Path("/tmp/proxy.py").write_text(proxy)
-          print("OK: proxy.py written with Gemma 4 user/model primer.")
-          PYEOF
-
-      - name: Start llama-server
+      - name: Start Llama Server with Template Injection
         run: |
-          echo "Starting llama-server on internal port $BACKEND_PORT..."
-          nohup "$SERVER_BIN" \
+          # We use --chat-template gemma to ensure the wrapper is correct
+          $SERVER_BIN \
             --model "$MODEL_PATH" \
-            --host "127.0.0.1" \
-            --port "$BACKEND_PORT" \
-            --ctx-size "$CTX_SIZE" \
-            --n-gpu-layers 0 \
-            --chat-template gemma3 \
-            --temp "$TEMPERATURE" \
-            --top-p 0.95 \
-            --top-k 64 \
-            --repeat-penalty 1.05 \
-            --slots \
-            --log-disable \
-            2>&1 | grep -v "^warning:" > server.log &
-          echo $! > server.pid
-          echo "llama-server PID: $(cat server.pid)"
-
-          echo "Waiting for llama-server (up to 10 min for 15 GB model)..."
-          for i in $(seq 1 300); do
-            if curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1; then
-              echo "OK: llama-server ready after ~$((i*2))s"
-              break
-            fi
-            if [ "$i" -eq 300 ]; then
-              echo "ERROR: llama-server did not start in 10 minutes."
-              tail -50 server.log
-              exit 1
-            fi
-            sleep 2
+            --port ${{ env.SERVER_PORT }} \
+            --ctx-size 8192 \
+            --batch-size 512 \
+            --threads $(nproc) \
+            --alias "gemma-4" \
+            --chat-template gemma \
+            --system-prompt-file /tmp/system_prompt.txt &
+          
+          echo "Waiting for model to load..."
+          until curl -s http://localhost:${{ env.SERVER_PORT }}/health | grep -q "ok"; do
+            sleep 5
           done
+          echo "Model is Online with Ollama-style wrapping."
 
-      - name: Start Proxy
+      - name: Expose via Cloudflared
         run: |
-          echo "Starting proxy on port $SERVER_PORT..."
-          PROXY_PORT=$SERVER_PORT nohup python3 /tmp/proxy.py > proxy.log 2>&1 &
-          echo $! > proxy.pid
-          sleep 3
-          if curl -sf "http://127.0.0.1:$SERVER_PORT/health" > /dev/null 2>&1; then
-            echo "OK: Proxy healthy on :$SERVER_PORT"
-          else
-            echo "ERROR: Proxy failed to start."
-            cat proxy.log
-            exit 1
-          fi
+          wget -q https://github.com
+          sudo dpkg -i cloudflared-linux-amd64.deb
+          cloudflared tunnel --url http://localhost:${{ env.SERVER_PORT }} &
+          sleep 5
+          echo "---------------------------------------------------"
+          echo "TUNNEL ENDPOINT FOUND BELOW:"
+          curl -s http://localhost:45678/metrics | grep -o 'https://[-a-z0-9.]*.trycloudflare.com' || true
+          echo "---------------------------------------------------"
 
-      - name: Verify Persona Is Active
+      - name: Keep Alive
         run: |
-          echo "Verifying model persona..."
-          RESP=$(curl -sf "http://127.0.0.1:$SERVER_PORT/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Who are you and what can you help me with?\"}],\"max_tokens\":150,\"temperature\":0.1}" \
-            2>/dev/null)
-          CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content' 2>/dev/null)
-          echo "---------- Model response ----------"
-          echo "$CONTENT"
-          echo "------------------------------------"
-          if [ -z "$CONTENT" ] || [ "$CONTENT" = "null" ]; then
-            echo "ERROR: Empty response - check logs."
-            tail -20 server.log
-            tail -10 proxy.log
-            exit 1
-          fi
-          echo "OK: Model is responding."
-
-      - name: Start Cloudflare Tunnel
-        run: |
-          pkill -9 -f cloudflared 2>/dev/null || true
-          sleep 2
-          curl -fsSL \
-            -o /tmp/cf.deb \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
-          nohup cloudflared tunnel \
-            --url "http://127.0.0.1:$SERVER_PORT" \
-            --no-autoupdate \
-            --loglevel info \
-            > tunnel.log 2>&1 &
-          echo $! > tunnel.pid
-
-          TUNNEL_URL=""
-          for i in $(seq 1 40); do
-            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
-            if [ -n "$TUNNEL_URL" ]; then
-              TUNNEL_URL="${TUNNEL_URL%/}"
-              echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
-              break
-            fi
-            sleep 2
-          done
-
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "WARNING: Tunnel URL not found."
-            cat tunnel.log
-          fi
-
-          echo "=================================================="
-          echo " GEMMA 4 E4B - SENIOR ENGINEER - READY"
-          echo "=================================================="
-          echo " Tunnel   : $TUNNEL_URL"
-          echo " Model    : $MODEL_FILENAME"
-          echo " Context  : $CTX_SIZE tokens"
-          echo "--------------------------------------------------"
-          echo " Continue / Roo Code settings"
-          echo "   Provider : OpenAI-compatible"
-          echo "   Base URL : ${TUNNEL_URL}/v1"
-          echo "   Model ID : $MODEL_FILENAME"
-          echo "   API Key  : any non-empty string"
-          echo "=================================================="
-
-      - name: Smoke Test
-        if: env.CLOUDFLARE_URL != ''
-        run: |
-          echo "--- Smoke test: count 1 to 10 in Python ---"
-          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_FILENAME\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a Python script that counts from 1 to 10 and prints each number.\"}],\"max_tokens\":200,\"temperature\":0.1}" \
-            2>/dev/null | jq -r '.choices[0].message.content' 2>/dev/null \
-            || echo "Smoke test parse failed"
-
-      - name: Keepalive
-        run: |
-          END=$(( $(date +%s) + $SESSION_HOURS * 3600 ))
-          while [ "$(date +%s)" -lt "$END" ]; do
-            REMAINING=$(( (END - $(date +%s)) / 60 ))
-            curl -sf "http://127.0.0.1:$BACKEND_PORT/health" > /dev/null 2>&1 || echo "WARNING: llama-server unhealthy"
-            curl -sf "http://127.0.0.1:$SERVER_PORT/health"  > /dev/null 2>&1 || echo "WARNING: proxy unhealthy"
-            [ -n "${{ env.CLOUDFLARE_URL }}" ] && curl -sf "${{ env.CLOUDFLARE_URL }}/health" > /dev/null 2>&1 || true
-            echo "Keepalive: ${REMAINING}min remaining - $(date -u '+%H:%M:%S UTC')"
-            sleep 300
-          done
-
-      - name: Final Report
-        if: always()
-        run: |
-          echo "========== FINAL REPORT =========="
-          [ -n "${{ env.CLOUDFLARE_URL }}" ] && echo "Tunnel: ${{ env.CLOUDFLARE_URL }}" || echo "Tunnel: (not available)"
-          echo "--- Model ---"
-          ls -lh "$MODEL_PATH" 2>/dev/null || echo "(not found)"
-          echo "--- llama-server health ---"
-          curl -sf "http://127.0.0.1:$BACKEND_PORT/health" 2>/dev/null | jq . || echo "(unreachable)"
-          echo "--- proxy health ---"
-          curl -sf "http://127.0.0.1:$SERVER_PORT/health" 2>/dev/null | jq . || echo "(unreachable)"
-          echo "--- server.log (last 20) ---"
-          tail -20 server.log 2>/dev/null || echo "(none)"
-          echo "--- proxy.log (last 10) ---"
-          tail -10 proxy.log 2>/dev/null || echo "(none)"
-          echo "--- tunnel.log (last 10) ---"
-          tail -10 tunnel.log 2>/dev/null || echo "(none)"
-
-      - name: Cleanup
-        if: always()
-        run: |
-          [ -f tunnel.pid ] && kill -9 "$(cat tunnel.pid)" 2>/dev/null || true
-          [ -f proxy.pid  ] && kill -9 "$(cat proxy.pid)"  2>/dev/null || true
-          [ -f server.pid ] && kill -9 "$(cat server.pid)" 2>/dev/null || true
-          pkill -9 -f cloudflared  2>/dev/null || true
-          pkill -9 -f llama-server 2>/dev/null || true
-          pkill -9 -f proxy.py     2>/dev/null || true
-          sudo fuser -k "$SERVER_PORT/tcp"  2>/dev/null || true
-          sudo fuser -k "$BACKEND_PORT/tcp" 2>/dev/null || true
-          rm -f ./*.pid
-          echo "Done."
+          echo "Session active for ${{ env.SESSION_HOURS }} hours."
+          sleep $(( ${{ env.SESSION_HOURS }} * 3600 ))
