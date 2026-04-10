@@ -196,8 +196,9 @@ jobs:
           pkill -9 -f cloudflared 2>/dev/null || true
           sleep 2
 
+          # ⚠️ CRITICAL: Tunnel MUST point to PROXY_PORT (8000), NOT Ollama port (11434)
           nohup cloudflared tunnel \
-            --url http://localhost:${{ env.PROXY_PORT }} \
+            --url http://127.0.0.1:${{ env.PROXY_PORT }} \
             --no-autoupdate \
             --loglevel info \
             > tunnel.log 2>&1 &
@@ -206,67 +207,65 @@ jobs:
           echo "⏳ Waiting for Cloudflare tunnel URL..."
           TUNNEL_URL=""
           for i in {1..40}; do
-            # Extract only alphanumeric+dash hostnames — never picks up markdown
-            RAW=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
-              tunnel.log 2>/dev/null | head -1)
+            # Extract clean URL — avoid markdown artifacts from GitHub logs
+            RAW=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
             if [ -n "$RAW" ]; then
-              # Belt-and-suspenders: strip any stray underscores and slashes
-              TUNNEL_URL="${RAW//__/}"
-              TUNNEL_URL="${TUNNEL_URL%/}"
+              TUNNEL_URL="${RAW//__/}"  # strip __ (markdown bold)
+              TUNNEL_URL="${TUNNEL_URL%/}"  # strip trailing slash
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
-            [ $i -eq 40 ] && {
-              echo "❌ Tunnel URL not found after 80 seconds"
-              echo "--- tunnel.log ---"
-              cat tunnel.log
-            }
+            [ $i -eq 40 ] && { echo "❌ Tunnel URL not found"; cat tunnel.log; exit 1; }
             sleep 2
           done
 
           if [ -n "$TUNNEL_URL" ]; then
-            # Write clean URL to GITHUB_ENV (no markdown, no trailing slash)
+            # Export clean URL for subsequent steps
             echo "CLOUDFLARE_URL=${TUNNEL_URL}" >> "$GITHUB_ENV"
 
-            # Wait for the tunnel to actually serve HTTP before printing instructions
-            echo "⏳ Waiting for tunnel to become reachable..."
+            # Verify tunnel is actually serving HTTP before proceeding
+            echo "⏳ Waiting for tunnel to respond to /health..."
             for j in {1..20}; do
-              CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 10 "${TUNNEL_URL}/health" 2>/dev/null || echo "000")
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${TUNNEL_URL}/health" 2>/dev/null || echo "000")
               if [ "$CODE" = "200" ]; then
-                echo "✅ Tunnel reachable (HTTP 200)"
+                echo "✅ Tunnel reachable (HTTP 200 on /health)"
                 break
               fi
               echo "  Attempt $j — HTTP $CODE"
-              [ $j -eq 20 ] && echo "⚠️  Proceeding even though tunnel may not be fully ready"
+              [ $j -eq 20 ] && echo "⚠️  Proceeding anyway (tunnel may be slow)"
               sleep 3
             done
 
+            # Print clear, copy-pasteable client config
             echo ""
-            echo "╔══════════════════════════════════════════════════════════════════════╗"
-            echo "║   🤖  OLLAMA PROXY — gemma4:e4b — RAM-RESIDENT MODE ACTIVE          ║"
-            echo "╠══════════════════════════════════════════════════════════════════════╣"
-            printf "║  URL : %-63s║\n" "${TUNNEL_URL}"
-            echo "║                                                                      ║"
-            echo "║  Option A — OpenAI-compatible (Continue, Roo, LM Studio)             ║"
-            printf "║    apiBase : %-53s║\n" "${TUNNEL_URL}/v1"
-            printf "║    model   : %-53s║\n" "gemma4:e4b"
-            echo "║                                                                      ║"
-            echo "║  Option B — Raw Ollama (Open WebUI, Ollama CLI)                      ║"
-            printf "║    apiBase : %-53s║\n" "${TUNNEL_URL}"
-            printf "║    model   : %-53s║\n" "gemma4:e4b"
-            echo "║                                                                      ║"
-            echo "║  Option C — Anthropic-compatible clients                             ║"
-            printf "║    apiBase : %-53s║\n" "${TUNNEL_URL}/v1/messages"
-            printf "║    model   : %-53s║\n" "gemma4:e4b"
-            echo "║                                                                      ║"
-            echo "║  Do NOT add a trailing slash to the URL                              ║"
-            echo "╚══════════════════════════════════════════════════════════════════════╝"
+            echo "╔════════════════════════════════════════════════════════════════╗"
+            echo "║   🤖  OLLAMA PROXY v4.1 — gemma4:e4b — READY                   ║"
+            echo "╠════════════════════════════════════════════════════════════════╣"
+            printf "║  Tunnel:  %-55s║\n" "${TUNNEL_URL}"
+            echo "║                                                                  ║"
+            echo "║  ✅ CLIENT CONFIG — COPY ONE OF THESE:                          ║"
+            echo "║                                                                  ║"
+            echo "║  [OpenAI-compatible clients]                                     ║"
+            printf "║    apiBase: %-48s║\n" "${TUNNEL_URL}/v1"
+            printf "║    model:   %-48s║\n" "${MODEL}"
+            echo "║                                                                  ║"
+            echo "║  [Raw Ollama clients / Open WebUI]                               ║"
+            printf "║    apiBase: %-48s║\n" "${TUNNEL_URL}"
+            printf "║    model:   %-48s║\n" "${MODEL}"
+            echo "║                                                                  ║"
+            echo "║  [Anthropic-compatible clients]                                  ║"
+            printf "║    apiBase: %-48s║\n" "${TUNNEL_URL}/v1/messages"
+            printf "║    model:   %-48s║\n" "${MODEL}"
+            echo "║                                                                  ║"
+            echo "║  ⚠️  IMPORTANT:                                                  ║"
+            echo "║    • NEVER use 'apibase://:80' or omit https://                  ║"
+            echo "║    • NEVER add a trailing slash to apiBase                       ║"
+            echo "║    • The proxy handles all routing — just set apiBase correctly  ║"
+            echo "╚════════════════════════════════════════════════════════════════╝"
             echo ""
-            # Plain-text notice — avoid ::notice:: which GitHub wraps in markdown
-            echo "==> Option A (OpenAI)  : ${TUNNEL_URL}/v1"
-            echo "==> Option B (Ollama)  : ${TUNNEL_URL}"
-            echo "==> Option C (Anthropic): ${TUNNEL_URL}/v1/messages"
+            echo "==> OpenAI:     ${TUNNEL_URL}/v1"
+            echo "==> Raw Ollama: ${TUNNEL_URL}"
+            echo "==> Anthropic:  ${TUNNEL_URL}/v1/messages"
           fi
 
       - name: 🧪 Test All Endpoints
