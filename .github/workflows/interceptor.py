@@ -2,7 +2,7 @@ import http.server, json, os, re, uuid, urllib.request, urllib.error, traceback
 
 BACKEND = "http://127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
 PORT    = int(os.environ.get("PROXY_PORT", "1234"))
-MODEL   = os.environ.get("MODEL", "gemma4:e4b")
+MODEL   = os.environ.get("MODEL", "gemma3:4b")
 
 SYSTEM_PROMPT = (
     "You are a Senior Software Developer with 15 years of full-stack experience. "
@@ -14,7 +14,7 @@ SYSTEM_PROMPT = (
     "You are running inside Roo Code (VS Code extension). You have access to tools.\n\n"
     "TOOL CALL PROTOCOL\n"
     "When you need to use a tool output ONLY a JSON function call in this exact format:\n"
-    '{"tool_use": {"name": "<tool_name>", "parameters": {<key-value pairs>}}}\n\n'
+    "{\"tool_use\": {\"name\": \"<tool_name>\", \"parameters\": {<key-value pairs>}}}\n\n"
     "Available tools:\n"
     "  read_file        : {\"path\": \"<path>\"}\n"
     "  write_file       : {\"path\": \"<path>\", \"content\": \"<full file content>\"}\n"
@@ -112,6 +112,7 @@ def inject_system_prompt(messages):
 
 
 class Interceptor(http.server.BaseHTTPRequestHandler):
+
     def log_message(self, fmt, *args):
         pass
 
@@ -132,6 +133,34 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def do_GET(self):
+        if self.path in ("/health", "/v1/health"):
+            try:
+                r = urllib.request.urlopen(BACKEND + "/api/tags", timeout=5)
+                if r.status == 200:
+                    body = b'{"status":"ok"}'
+                    self.send_response(200)
+                    self._cors()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+            except Exception:
+                pass
+            body = b'{"status":"unavailable"}'
+            self.send_response(503)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self._fwd()
+
+    def do_DELETE(self):
+        self._fwd()
+
     def _fwd(self, body=None):
         url  = BACKEND + self.path
         hdrs = {
@@ -147,6 +176,16 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
             st, rh, rb = r.status, r.headers, r.read()
         except urllib.error.HTTPError as e:
             st, rh, rb = e.code, e.headers, e.read()
+        except Exception as e:
+            print("[interceptor] forward error: " + str(e), flush=True)
+            body = json.dumps({"error": str(e)}).encode()
+            self.send_response(502)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(st)
         self._cors()
         for k, v in rh.items():
@@ -156,19 +195,15 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(rb)
 
-    def do_GET(self):
-        self._fwd()
-
-    def do_DELETE(self):
-        self._fwd()
-
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw    = self.rfile.read(length)
+        length  = int(self.headers.get("Content-Length", 0))
+        raw     = self.rfile.read(length)
         is_chat = "/chat/completions" in self.path or "/api/chat" in self.path
+
         if not is_chat:
             self._fwd(raw)
             return
+
         try:
             payload = json.loads(raw)
             payload["messages"] = inject_system_prompt(payload.get("messages", []))
@@ -192,6 +227,7 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
             }
             hdrs["Host"]           = "127.0.0.1:" + os.environ.get("OLLAMA_PORT", "11434")
             hdrs["Content-Length"] = str(len(raw))
+
             req = urllib.request.Request(url, data=raw, headers=hdrs, method="POST")
             try:
                 r = urllib.request.urlopen(req, timeout=600)
@@ -199,6 +235,11 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
             except urllib.error.HTTPError as e:
                 st, rh, rb = e.code, e.headers, e.read()
                 self._reply(st, rb)
+                return
+            except Exception as e:
+                print("[interceptor] ollama error: " + str(e), flush=True)
+                body = json.dumps({"error": {"message": str(e), "type": "upstream_error"}}).encode()
+                self._reply(502, body)
                 return
 
             try:
@@ -215,8 +256,10 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
 
             tool_name, tool_params = extract_tool_call(assistant_text)
             if tool_name:
-                print("[interceptor] tool call: " + tool_name, flush=True)
-                body = json.dumps(build_tool_call_response(tool_name, tool_params, resp_obj)).encode()
+                print("[interceptor] tool call detected: " + tool_name, flush=True)
+                body = json.dumps(
+                    build_tool_call_response(tool_name, tool_params, resp_obj)
+                ).encode()
                 self._reply(200, body)
                 return
 
@@ -224,7 +267,10 @@ class Interceptor(http.server.BaseHTTPRequestHandler):
 
         except Exception:
             traceback.print_exc()
-            self._fwd(raw)
+            try:
+                self._fwd(raw)
+            except Exception:
+                pass
 
     def _fwd_raw(self, status, headers, body):
         self.send_response(status)
