@@ -22,6 +22,9 @@ on:
         default: '6'
 
 env:
+  # Opt into Node.js 24 for actions (fixes deprecation warning)
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  
   MODEL: ${{ github.event.inputs.model || 'sorc/qwen3.5-claude-4.6-opus:4b' }}
   RAM_PRESSURE_ENABLED: ${{ github.event.inputs.enable_ram_pressure || 'true' }}
   RAM_PRESSURE_MB: '256'
@@ -45,7 +48,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # Removed cache: 'pip' to avoid requirements.txt warning
+          # We install packages directly in the next step
+
+      - name: 📥 Create requirements.txt (for transparency)
+        run: |
+          cat > requirements.txt << 'EOF'
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+requests>=2.31.0
+pydantic>=2.0.0
+starlette>=0.27.0
+psutil>=5.9.0
+numpy>=1.24.0
+EOF
+          echo "✅ Created requirements.txt"
+          cat requirements.txt
 
       - name: 📥 Install System Dependencies
         run: |
@@ -55,40 +73,61 @@ jobs:
       - name: 📥 Install Python Dependencies
         run: |
           pip install --upgrade pip --quiet
-          pip install --quiet fastapi uvicorn[standard] requests pydantic>=2.0 starlette psutil numpy
+          pip install --quiet -r requirements.txt
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
-          pip list --format=freeze | grep -E "^(fastapi|uvicorn|torch|psutil)=="
+          echo "✅ Python packages installed"
+          pip list --format=freeze | grep -E "^(fastapi|uvicorn|torch|psutil|numpy)=="
 
       - name: 📥 Install Ollama
         run: |
+          echo "🔧 Installing Ollama..."
           curl -fsSL https://ollama.com/install.sh | sh
           ollama --version
+          echo "✅ Ollama installed"
 
       - name: 📥 Install Cloudflared
         run: |
+          echo "🔧 Installing cloudflared..."
           curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
           rm -f /tmp/cf.deb
-          cloudflared --version 2>/dev/null && echo "✅ Cloudflared ready" || true
+          cloudflared --version 2>/dev/null && echo "✅ Cloudflared ready" || echo "⚠️ Cloudflared skipped"
 
       - name: 🚀 Start Ollama Server
         run: |
+          echo "🚀 Starting Ollama server..."
           export OLLAMA_HOST="127.0.0.1:${{ env.OLLAMA_PORT }}"
           export OLLAMA_ORIGINS="*"
           export OLLAMA_KEEP_ALIVE="-1"
+          
           nohup ollama serve > ollama.log 2>&1 &
           echo $! > ollama.pid
+          
+          echo "⏳ Waiting for Ollama (max 60s)..."
           for i in {1..30}; do
-            curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/tags > /dev/null && break
-            [ $i -eq 30 ] && echo "❌ Ollama failed to start" && exit 1
+            if curl -sf http://127.0.0.1:${{ env.OLLAMA_PORT }}/api/tags > /dev/null 2>&1; then
+              echo "✅ Ollama ready!"
+              break
+            fi
+            [ $i -eq 30 ] && echo "❌ Ollama failed to start" && tail -20 ollama.log && exit 1
             sleep 2
           done
-          echo "✅ Ollama ready"
-          ollama pull ${{ env.MODEL }}
+          
+          echo "📦 Pulling model: ${{ env.MODEL }}..."
+          timeout 600 ollama pull ${{ env.MODEL }} || {
+            echo "⚠️ Model pull timed out or failed, continuing anyway..."
+          }
 
       - name: 🚀 Start Proxy Server
         run: |
+          echo "🚀 Starting proxy server..."
+          
+          # Ensure ports are free
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp 2>/dev/null || true
+          sudo fuser -k ${{ env.OLLAMA_PORT }}/tcp 2>/dev/null || true
+          sleep 2
+          
+          # Set environment variables for proxy
           export MODEL="${{ env.MODEL }}"
           export RAM_PRESSURE_ENABLED="${{ env.RAM_PRESSURE_ENABLED }}"
           export RAM_PRESSURE_MB="${{ env.RAM_PRESSURE_MB }}"
@@ -96,53 +135,111 @@ jobs:
           export KEEPALIVE_INTERVAL="${{ env.KEEPALIVE_INTERVAL }}"
           export PROXY_PORT="${{ env.PROXY_PORT }}"
           export OLLAMA_PORT="${{ env.OLLAMA_PORT }}"
+          
+          # Start proxy
           nohup python3 proxy_server.py > proxy.log 2>&1 &
           echo $! > proxy.pid
+          
+          # Wait for proxy to be ready
+          echo "⏳ Waiting for proxy (max 60s)..."
           for i in {1..20}; do
-            curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health > /dev/null && break
-            [ $i -eq 20 ] && echo "❌ Proxy failed to start" && tail -20 proxy.log && exit 1
+            if curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health > /dev/null 2>&1; then
+              echo "✅ Proxy ready on port ${{ env.PROXY_PORT }}!"
+              echo ""
+              echo "📊 Health check:"
+              curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | python3 -m json.tool
+              echo ""
+              break
+            fi
+            [ $i -eq 20 ] && echo "❌ Proxy failed to start" && echo "=== Proxy Log ===" && tail -30 proxy.log && exit 1
             sleep 3
           done
-          echo "✅ Proxy ready on port ${{ env.PROXY_PORT }}"
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | python3 -m json.tool
 
-      - name: 🧪 Test Tool Calling
+      - name: 🧪 Test Tool Calling Endpoints
         run: |
-          echo "🧪 Testing endpoints..."
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/v1/tools | python3 -m json.tool | head -15
+          echo "🧪 Testing tool calling endpoints..."
+          
+          echo "1️⃣  /v1/tools:"
+          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/v1/tools | python3 -m json.tool | head -12
           echo ""
+          
+          echo "2️⃣  Direct tool execution (calculate):"
           curl -sf -X POST http://127.0.0.1:${{ env.PROXY_PORT }}/v1/tool/execute \
             -H "Content-Type: application/json" \
-            -d '{"name": "calculate", "arguments": {"expression": "2 + 2 * 3"}}' | python3 -m json.tool
+            -d '{"name": "calculate", "arguments": {"expression": "15 * 3 + 7"}}' | python3 -m json.tool
+          echo ""
+          
+          echo "3️⃣  Basic chat:"
+          curl -sf -X POST http://127.0.0.1:${{ env.PROXY_PORT }}/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "'"${{ env.MODEL }}"'", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}' | python3 -m json.tool | head -10
+          echo ""
+          
+          echo "✅ All tests completed"
 
       - name: ⏱️ Session Pulser (${{ env.SESSION_HOURS }} hours)
         run: |
           SESSION_SECONDS=$((${{ env.SESSION_HOURS }} * 3600))
-          echo "⏱️ Starting ${SESSION_SECONDS}s session pulser..."
-          START=$(date +%s); END=$((START + SESSION_SECONDS))
+          echo "⏱️ Starting ${SESSION_SECONDS}s (${{ env.SESSION_HOURS }}h) session pulser..."
+          echo "📝 Status logged every 5 minutes"
+          echo ""
+          
+          START=$(date +%s)
+          END=$((START + SESSION_SECONDS))
+          
           while [ $(date +%s) -lt $END ]; do
-            ELAPSED=$(($(date +%s) - START)); REMAINING=$((END - $(date +%s)))
+            ELAPSED=$(($(date +%s) - START))
+            REMAINING=$((END - $(date +%s)))
             PCT=$((ELAPSED * 100 / SESSION_SECONDS))
-            echo "⏰ $(date '+%H:%M:%S') | ${PCT}% | ${REMAINING}s remaining"
-            curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'🏥 {d.get(\"status\")}')" || echo "🏥 down"
-            tail -n 3 proxy.log 2>/dev/null | sed 's/^/📝 /'
-            sleep 300
+            REM_H=$((REMAINING / 3600))
+            REM_M=$(((REMAINING % 3600) / 60))
+            
+            echo ""
+            echo "════════════════════════════════════"
+            echo "⏰ $(date '+%H:%M:%S') | ${PCT}% complete"
+            echo "⏳ Remaining: ${REM_H}h ${REM_M}m"
+            echo "════════════════════════════════════"
+            
+            # Health check
+            HEALTH=$(curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null || echo '{"status":"error"}')
+            STATUS=$(echo "$HEALTH" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "?")
+            echo "🏥 Proxy: $STATUS"
+            
+            # Recent logs
+            echo "📝 Recent activity:"
+            tail -n 5 proxy.log 2>/dev/null | sed 's/^/   /' || echo "   (no logs)"
+            
+            echo "════════════════════════════════════"
+            
+            sleep 300  # 5 minutes
           done
-          echo "🏁 Session complete!"
+          
+          echo ""
+          echo "🏁 Session completed! (${{ env.SESSION_HOURS }} hours)"
 
       - name: 📊 Final Report
         if: always()
         run: |
-          echo "📊 Final Report"
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null | python3 -m json.tool || echo "Proxy down"
-          echo "📝 Last proxy logs:"
-          tail -n 20 proxy.log 2>/dev/null | sed 's/^/   /'
+          echo "📊 Final Session Report"
+          echo "════════════════════════════════════"
+          
+          echo "🏥 Final health:"
+          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null | python3 -m json.tool || echo "Proxy not responding"
+          
+          echo ""
+          echo "📝 Last 20 proxy log lines:"
+          tail -n 20 proxy.log 2>/dev/null | sed 's/^/   /' || echo "   (no logs)"
+          
+          echo ""
+          echo "════════════════════════════════════"
+          echo "✅ Workflow completed"
 
       - name: 🛑 Cleanup
         if: always()
         run: |
-          [ -f proxy.pid ] && kill -9 $(cat proxy.pid) 2>/dev/null || true
-          [ -f ollama.pid ] && kill -9 $(cat ollama.pid) 2>/dev/null || true
+          echo "🛑 Cleaning up..."
+          [ -f proxy.pid ] && kill -9 $(cat proxy.pid) 2>/dev/null && echo "✅ Killed proxy" || true
+          [ -f ollama.pid ] && kill -9 $(cat ollama.pid) 2>/dev/null && echo "✅ Killed Ollama" || true
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp ${{ env.OLLAMA_PORT }}/tcp 2>/dev/null || true
-          rm -f proxy.pid ollama.pid 2>/dev/null || true
-          echo "✅ Cleanup done"
+          rm -f proxy.pid ollama.pid requirements.txt 2>/dev/null || true
+          echo "✅ Cleanup complete"
