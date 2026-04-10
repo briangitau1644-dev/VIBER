@@ -138,7 +138,7 @@ def _make_session() -> requests.Session:
 ollama = _make_session()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOOL DEFINITIONS (unchanged from v4)
+# TOOL DEFINITIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 TOOL_DEFINITIONS = [
@@ -157,7 +157,7 @@ TOOL_DEFINITIONS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOOL EXECUTOR (unchanged from v4)
+# TOOL EXECUTOR
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ToolExecutor:
@@ -373,7 +373,7 @@ class ToolExecutor:
 tool_executor = ToolExecutor()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OLLAMA CAPABILITY DETECTION (unchanged)
+# OLLAMA CAPABILITY DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_ollama_capabilities() -> bool:
@@ -447,7 +447,7 @@ def ensure_model_in_ram():
         return False
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BACKGROUND THREADS (unchanged)
+# BACKGROUND THREADS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _ram_buffer = None
@@ -530,7 +530,7 @@ def start_background_threads():
     log("✅ All background threads running")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FORMAT HELPERS (unchanged)
+# FORMAT HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _norm_params(p) -> Dict:
@@ -769,7 +769,7 @@ def _call_ollama_stream(
     return r, "generate"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STREAMING GENERATORS (unchanged logic, just using fixed backend calls)
+# STREAMING GENERATORS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _stream_openai(messages, tools, max_tokens, temp):
@@ -927,7 +927,7 @@ def _effective_tools(req_tools, tc):
     return req_tools if req_tools is not None else TOOL_DEFINITIONS
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES — Discovery & Health (enhanced with tunnel debug info)
+# ROUTES — Discovery & Health
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -942,7 +942,7 @@ async def root():
         "ram_keepalive": True,
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "tools_count": len(TOOL_DEFINITIONS),
-        "backend_ollama": OLLAMA_BASE,  # Debug: show backend URL
+        "backend_ollama": OLLAMA_BASE,
         "routes": ["/v1/chat/completions", "/v1/messages", "/v1/models", "/api/chat", "/api/generate", "/api/tags", "/api/version", "/api/ps", "/health", "/v1/tools", "/v1/tool/execute"],
     }
 
@@ -972,14 +972,14 @@ async def health():
                 "tools_count": len(TOOL_DEFINITIONS),
                 "ollama_ok": True,
                 "proxy_version": "4.1.0",
-                "backend_url": OLLAMA_BASE,  # Debug info
+                "backend_url": OLLAMA_BASE,
             }
     except Exception as e:
         return {"status": "down", "model": MODEL, "error": str(e), "ollama_ok": False, "backend_url": OLLAMA_BASE}
     return {"status": "down", "model": MODEL, "ollama_ok": False, "backend_url": OLLAMA_BASE}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES — OpenAI-compatible (unchanged logic, using fixed backend calls)
+# ROUTES — OpenAI-compatible
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
@@ -1057,7 +1057,7 @@ async def anthropic_messages(request: Request):
     return {"id": f"msg_{uuid.uuid4().hex[:8]}", "type": "message", "role": "assistant", "model": MODEL, "content": blocks, "stop_reason": stop, "usage": {"input_tokens": result.get("prompt_eval_count", 0), "output_tokens": result.get("eval_count", 0)}}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES — Raw Ollama passthrough (backend URL hardcoded)
+# ROUTES — Raw Ollama passthrough
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/chat")
@@ -1150,7 +1150,7 @@ async def ollama_ps():
         return {"models": []}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ROUTES — Tool execution & RAM control (unchanged)
+# ROUTES — Tool execution & RAM control
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/v1/tool/execute")
@@ -1173,7 +1173,7 @@ async def reload_model_into_ram():
     return {"success": ok, "model": MODEL, "keep_alive": OLLAMA_KEEP_ALIVE}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CATCH-ALL — Improved error message for misconfigured clients
+# CATCH-ALL
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
