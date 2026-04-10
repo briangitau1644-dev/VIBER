@@ -1,3 +1,6 @@
+<layout>
+    # domains_identified: [Local]
+</layout>
 name: Senior Engineer CPU - Gemma4-E4B - GitHub Actions
 
 on:
@@ -6,7 +9,7 @@ on:
       model_download_url:
         description: 'Direct GGUF download URL'
         required: false
-        default: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-bf16.gguf?download=true'
+        default: 'https://huggingface.co'
       model_filename:
         description: 'GGUF filename'
         required: false
@@ -21,7 +24,8 @@ env:
   MODEL_FILENAME: ${{ github.event.inputs.model_filename }}
   MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
   SESSION_HOURS: ${{ github.event.inputs.session_hours }}
-  SERVER_PORT: '11434' # Using Ollama's default port for compatibility
+  SERVER_PORT: '8080' # Internal llama-server port
+  BACKEND_PORT: '11434' # Public proxy port (Ollama default)
   MODEL_PATH: 'models/google_gemma-4-E4B-it-bf16.gguf'
 
 jobs:
@@ -38,6 +42,8 @@ jobs:
         run: |
           pkill -9 -f llama-server 2>/dev/null || true
           pkill -9 -f cloudflared  2>/dev/null || true
+          pkill -9 -f proxy.py     2>/dev/null || true
+          sudo fuser -k 8080/tcp   2>/dev/null || true
           sudo fuser -k 11434/tcp  2>/dev/null || true
 
       - name: Install Dependencies
@@ -58,49 +64,60 @@ jobs:
           mkdir -p models
           curl -fL -o "$MODEL_PATH" "$MODEL_DOWNLOAD_URL"
 
-      - name: Create Ollama-Style Persona & Template
+      - name: Start Llama Server
         run: |
-          # This replicates the 'Ollama Modelfile' behavior
-          cat << 'EOF' > /tmp/system_prompt.txt
-          You are a Senior Full-Stack Engineer (15+ years exp). 
-          Expert in Python (Django/FastAPI), JS (React/Next.js), Rust, and DevOps.
-          Your tone: Professional, direct, architectural.
-          Rule 1: Always provide complete, copy-pasteable code.
-          Rule 2: No preamble/chatting unless necessary.
-          Rule 3: Use markdown formatting.
-          EOF
-
-      - name: Start Llama Server with Template Injection
-        run: |
-          # We use --chat-template gemma to ensure the wrapper is correct
+          # Use --chat-template to ensure the model follows Gemma's specific structure
           $SERVER_BIN \
             --model "$MODEL_PATH" \
             --port ${{ env.SERVER_PORT }} \
             --ctx-size 8192 \
-            --batch-size 512 \
             --threads $(nproc) \
-            --alias "gemma-4" \
-            --chat-template gemma \
-            --system-prompt-file /tmp/system_prompt.txt &
+            --chat-template gemma &
           
-          echo "Waiting for model to load..."
-          until curl -s http://localhost:${{ env.SERVER_PORT }}/health | grep -q "ok"; do
-            sleep 5
-          done
-          echo "Model is Online with Ollama-style wrapping."
+          sleep 10
+
+      - name: Start Ollama-Style Wrapper Proxy
+        run: |
+          # This script acts as the "Modelfile" by injecting the persona into every request
+          cat << 'PYEOF' > proxy.py
+          import http.server, urllib.request, json, os
+
+          SYSTEM_PROMPT = "You are a Senior Full-Stack Engineer (15+ years exp). Expert in Python Django, React, and DevOps. Provide complete code, no placeholders, and a professional tone."
+
+          class ProxyHandler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  content_length = int(self.headers['Content-Length'])
+                  body = json.loads(self.rfile.read(content_length))
+                  
+                  # Replicate Ollama's behavior: Ensure the system prompt is always present
+                  if "messages" in body:
+                      if body["messages"][0]["role"] != "system":
+                          body["messages"].insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+                  
+                  req = urllib.request.Request(
+                      "http://localhost:8080/v1/chat/completions",
+                      data=json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json"}
+                  )
+                  with urllib.request.urlopen(req) as res:
+                      self.send_response(res.getcode())
+                      self.send_header("Content-Type", "application/json")
+                      self.end_headers()
+                      self.wfile.write(res.read())
+
+          http.server.HTTPServer(('0.0.0.0', 11434), ProxyHandler).serve_forever()
+          PYEOF
+          python3 proxy.py &
+          sleep 5
 
       - name: Expose via Cloudflared
         run: |
           wget -q https://github.com
           sudo dpkg -i cloudflared-linux-amd64.deb
-          cloudflared tunnel --url http://localhost:${{ env.SERVER_PORT }} &
+          cloudflared tunnel --url http://localhost:11434 &
           sleep 5
-          echo "---------------------------------------------------"
-          echo "TUNNEL ENDPOINT FOUND BELOW:"
+          echo "TUNNEL ENDPOINT:"
           curl -s http://localhost:45678/metrics | grep -o 'https://[-a-z0-9.]*.trycloudflare.com' || true
-          echo "---------------------------------------------------"
 
       - name: Keep Alive
-        run: |
-          echo "Session active for ${{ env.SESSION_HOURS }} hours."
-          sleep $(( ${{ env.SESSION_HOURS }} * 3600 ))
+        run: sleep $(( ${{ env.SESSION_HOURS }} * 3600 ))
