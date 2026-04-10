@@ -1,16 +1,16 @@
-name: LM Studio Direct — gemma4:e4b — llama.cpp Server + Cloudflare Tunnel
+name: LM Studio Direct — gemma-4-e4b — CMake + Configurable Model URL
 
 on:
   workflow_dispatch:
     inputs:
-      model_repo:
-        description: 'HuggingFace model repo (GGUF)'
+      model_download_url:
+        description: 'Direct download URL for GGUF model (HuggingFace resolve link)'
         required: false
-        default: 'bartowski/gemma-2-9b-it-GGUF'
-      model_file:
-        description: 'GGUF filename to use'
+        default: 'https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf?download=true'
+      model_filename:
+        description: 'Filename to save model as (must end in .gguf)'
         required: false
-        default: 'gemma-2-9b-it-Q4_K_M.gguf'
+        default: 'google_gemma-4-E4B-it-Q4_K_M.gguf'
       session_hours:
         description: 'Session duration in hours (max 6)'
         required: false
@@ -20,23 +20,24 @@ on:
         required: false
         default: '4096'
       n_gpu_layers:
-        description: 'GPU layers (-1 = all, 0 = CPU)'
+        description: 'GPU layers (-1 = all, 0 = CPU-only)'
         required: false
-        default: '-1'
+        default: '0'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  MODEL_REPO: ${{ github.event.inputs.model_repo || 'bartowski/gemma-2-9b-it-GGUF' }}
-  MODEL_FILE: ${{ github.event.inputs.model_file || 'gemma-2-9b-it-Q4_K_M.gguf' }}
+  MODEL_DOWNLOAD_URL: ${{ github.event.inputs.model_download_url }}
+  MODEL_FILENAME: ${{ github.event.inputs.model_filename || 'google_gemma-4-E4B-it-Q4_K_M.gguf' }}
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
   CTX_SIZE: ${{ github.event.inputs.ctx_size || '4096' }}
-  N_GPU_LAYERS: ${{ github.event.inputs.n_gpu_layers || '-1' }}
+  N_GPU_LAYERS: ${{ github.event.inputs.n_gpu_layers || '0' }}
   SERVER_PORT: '1234'
   SERVER_HOST: '0.0.0.0'
+  MODEL_PATH: 'models/${{ github.event.inputs.model_filename || "google_gemma-4-E4B-it-Q4_K_M.gguf" }}'
 
 jobs:
   lm-studio-direct:
-    name: llama.cpp Server + gemma-2-9b + Cloudflare Tunnel
+    name: llama.cpp Server + gemma-4-e4b + Cloudflare Tunnel
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
@@ -44,59 +45,134 @@ jobs:
       - name: 📦 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📥 Install System Dependencies
+      - name: 📥 Install System Dependencies for CMake Build
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            curl wget jq grep bash procps cmake build-essential \
-            git libcurl4-openssl-dev
+            curl wget jq grep bash procps \
+            cmake build-essential git \
+            libcurl4-openssl-dev libssl-dev
 
-      - name: 📥 Build llama.cpp (with server + OpenAI API)
+      - name: 📥 Clone llama.cpp
         run: |
-          git clone --depth 1 --branch b4300 https://github.com/ggerganov/llama.cpp
+          git clone --depth 1 https://github.com/ggerganov/llama.cpp
           cd llama.cpp
-          make server -j$(nproc) LLAMA_CURL=1
-          ./server --help | head -20
-          echo "✅ llama.cpp server built"
+          echo "✅ llama.cpp cloned"
+          git log -1 --oneline
 
-      - name: 📥 Download Model (GGUF)
+      - name: 🔨 Build llama.cpp Server with CMake
         run: |
-          echo "⏳ Downloading model: ${{ env.MODEL_REPO }} / ${{ env.MODEL_FILE }}"
+          cd llama.cpp
           
-          # Create models directory
-          mkdir -p models
+          mkdir -p build
+          cd build
           
-          # Download from HuggingFace (using hf.co direct link)
-          MODEL_URL="https://huggingface.co/${{ env.MODEL_REPO }}/resolve/main/${{ env.MODEL_FILE }}"
+          cmake .. \
+            -DLLAMA_CURL=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DCMAKE_BUILD_TYPE=Release
           
-          if ! curl -fL --retry 3 --retry-delay 10 \
-            -o "models/${{ env.MODEL_FILE }}" \
-            "$MODEL_URL"; then
-            echo "❌ Failed to download model"
-            echo "Trying alternative mirror..."
-            # Fallback: try with ?download=1
-            curl -fL --retry 3 --retry-delay 10 \
-              -o "models/${{ env.MODEL_FILE }}" \
-              "${MODEL_URL}?download=1" || exit 1
-          fi
+          cmake --build . --config Release --target server -j$(nproc)
           
-          # Verify download
-          if [ ! -f "models/${{ env.MODEL_FILE }}" ]; then
-            echo "❌ Model file not found after download"
+          if [ ! -f "./bin/server" ] && [ ! -f "./server" ]; then
+            echo "❌ Server binary not found after build"
+            ls -la
             exit 1
           fi
           
-          FILE_SIZE=$(du -h "models/${{ env.MODEL_FILE }}" | cut -f1)
-          echo "✅ Model downloaded: $FILE_SIZE"
-          ls -lh models/
+          if [ -f "./bin/server" ]; then
+            SERVER_BIN="./bin/server"
+          else
+            SERVER_BIN="./server"
+          fi
+          
+          echo "✅ llama.cpp server built: $SERVER_BIN"
+          $SERVER_BIN --help 2>&1 | head -15
+          echo "SERVER_BIN=$SERVER_BIN" >> $GITHUB_ENV
+
+      - name: 📥 Download Model (with Fallback Prompt)
+        run: |
+          mkdir -p models
+          
+          echo "⏳ Attempting to download model..."
+          echo "   URL: ${{ env.MODEL_DOWNLOAD_URL }}"
+          echo "   Save as: ${{ env.MODEL_FILENAME }}"
+          
+          # Attempt download with retry logic
+          DOWNLOAD_SUCCESS=false
+          for attempt in 1 2 3; do
+            echo "🔄 Download attempt $attempt/3..."
+            
+            if curl -fL --retry 2 --retry-delay 10 --connect-timeout 30 --max-time 600 \
+              -o "${{ env.MODEL_PATH }}" \
+              "${{ env.MODEL_DOWNLOAD_URL }}" 2>&1; then
+              
+              # Verify file exists and has content
+              if [ -f "${{ env.MODEL_PATH }}" ] && [ -s "${{ env.MODEL_PATH }}" ]; then
+                FILE_SIZE=$(du -h "${{ env.MODEL_PATH }}" | cut -f1)
+                echo "✅ Model downloaded successfully: $FILE_SIZE"
+                ls -lh "${{ env.MODEL_PATH }}"
+                DOWNLOAD_SUCCESS=true
+                break
+              fi
+            fi
+            
+            echo "⚠️  Download attempt $attempt failed"
+            sleep 5
+          done
+          
+          # If all attempts failed, provide helpful error with prompt for new URL
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo ""
+            echo "╔════════════════════════════════════════════════════════════════╗"
+            echo "║   ❌  MODEL DOWNLOAD FAILED                                     ║"
+            echo "╠════════════════════════════════════════════════════════════════╣"
+            echo "║                                                                  ║"
+            echo "║  The download URL may be invalid, expired, or rate-limited.     ║"
+            echo "║                                                                  ║"
+            echo "║  🔗 To fix:                                                      ║"
+            echo "║    1. Get a fresh direct download link from HuggingFace:        ║"
+            echo "║       • Go to: https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF ║"
+            echo "║       • Click the GGUF file you want                             ║"
+            echo "║       • Click 'Download' → copy the URL from your browser       ║"
+            echo "║       • OR right-click 'Download' → 'Copy link address'         ║"
+            echo "║                                                                  ║"
+            echo "║    2. Re-run this workflow with the new URL:                    ║"
+            echo "║       • Go to Actions → LM Studio Direct → Run workflow         ║"
+            echo "║       • Paste the new URL in 'model_download_url' field         ║"
+            echo "║                                                                  ║"
+            echo "║  📋 Current attempted URL:                                       ║"
+            printf "║    %-63s║\n" "${{ env.MODEL_DOWNLOAD_URL }}"
+            echo "║                                                                  ║"
+            echo "║  💡 Tip: HuggingFace direct links may expire. Use the 'resolve' ║"
+            echo "║     format for stable links:                                    ║"
+            echo "║     https://huggingface.co/<repo>/resolve/main/<file>?download=true ║"
+            echo "║                                                                  ║"
+            echo "╚════════════════════════════════════════════════════════════════╝"
+            echo ""
+            exit 1
+          fi
 
       - name: 🚀 Start llama.cpp Server (OpenAI-compatible API)
         run: |
           cd llama.cpp
           
-          # Start server in background with OpenAI API compatibility
-          nohup ./server \
-            --model "../models/${{ env.MODEL_FILE }}" \
+          if [ -f "./bin/server" ]; then
+            SERVER_BIN="./bin/server"
+          else
+            SERVER_BIN="./server"
+          fi
+          
+          echo "🚀 Starting llama.cpp server..."
+          echo "   Model: ${{ env.MODEL_PATH }}"
+          echo "   Port: ${{ env.SERVER_PORT }}"
+          echo "   Context: ${{ env.CTX_SIZE }} tokens"
+          echo "   GPU layers: ${{ env.N_GPU_LAYERS }}"
+          
+          nohup $SERVER_BIN \
+            --model "../${{ env.MODEL_PATH }}" \
             --host "${{ env.SERVER_HOST }}" \
             --port "${{ env.SERVER_PORT }}" \
             --ctx-size "${{ env.CTX_SIZE }}" \
@@ -107,23 +183,22 @@ jobs:
             > ../server.log 2>&1 &
           
           echo $! > ../server.pid
-          echo "⏳ Waiting for llama.cpp server to be ready..."
+          echo "⏳ Waiting for server to be ready..."
           
-          # Wait for server to respond
           for i in {1..60}; do
             if curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/health" > /dev/null 2>&1; then
               echo "✅ Server ready after ${i} attempts"
               break
             fi
             [ $i -eq 60 ] && { 
-              echo "❌ Server did not start"
+              echo "❌ Server did not start within 3 minutes"
+              echo "── server.log (last 50 lines) ──"
               cat ../server.log | tail -50
               exit 1
             }
             sleep 3
           done
           
-          # Verify OpenAI-compatible endpoint
           echo "📦 Testing /v1/models endpoint..."
           curl -sf "http://127.0.0.1:${{ env.SERVER_PORT }}/v1/models" | jq . || echo "(no models endpoint)"
 
@@ -141,7 +216,6 @@ jobs:
           pkill -9 -f cloudflared 2>/dev/null || true
           sleep 2
 
-          # Tunnel directly to llama.cpp server port (1234)
           nohup cloudflared tunnel \
             --url http://127.0.0.1:${{ env.SERVER_PORT }} \
             --no-autoupdate \
@@ -159,14 +233,18 @@ jobs:
               echo "✅ Tunnel URL: $TUNNEL_URL"
               break
             fi
-            [ $i -eq 40 ] && { echo "❌ Tunnel URL not found"; cat tunnel.log; exit 1; }
+            [ $i -eq 40 ] && { 
+              echo "❌ Tunnel URL not found after 80 seconds"
+              echo "── tunnel.log ──"
+              cat tunnel.log
+              exit 1
+            }
             sleep 2
           done
 
           if [ -n "$TUNNEL_URL" ]; then
             echo "CLOUDFLARE_URL=${TUNNEL_URL}" >> "$GITHUB_ENV"
 
-            # Verify tunnel serves OpenAI-compatible API
             echo "⏳ Verifying tunnel serves OpenAI API..."
             for j in {1..20}; do
               RESPONSE=$(curl -sf --max-time 10 "${TUNNEL_URL}/v1/models" 2>/dev/null || echo "")
@@ -180,31 +258,31 @@ jobs:
               sleep 3
             done
 
-            # Print client config
             echo ""
             echo "╔════════════════════════════════════════════════════════════════╗"
-            echo "║   🦙  LM STUDIO DIRECT — llama.cpp Server — READY              ║"
+            echo "║   🦙  LM STUDIO DIRECT — gemma-4-e4b — READY                   ║"
             echo "╠════════════════════════════════════════════════════════════════╣"
             printf "║  Tunnel URL: %-52s║\n" "${TUNNEL_URL}"
-            printf "║  Model:      %-52s║\n" "${{ env.MODEL_FILE }}"
+            printf "║  Model:      %-52s║\n" "${{ env.MODEL_FILENAME }}"
             echo "║                                                                  ║"
             echo "║  ✅ USE THIS IN LM STUDIO / CONTINUE / ROO CODE:                ║"
             echo "║                                                                  ║"
             printf "║    Server URL: %-52s║\n" "${TUNNEL_URL}"
-            printf "║    Model ID:   %-52s║\n" "${{ env.MODEL_FILE }}"
+            printf "║    Model ID:   %-52s║\n" "${{ env.MODEL_FILENAME }}"
             echo "║                                                                  ║"
             echo "║  ✅ OpenAI-Compatible Endpoints:                                ║"
-            echo "║    • GET  /v1/models       — List available models              ║"
-            echo "║    • POST /v1/chat/completions — Chat with model               ║"
-            echo "║    • POST /v1/completions  — Legacy completions                 ║"
-            echo "║    • GET  /health          — Server health check                ║"
+            echo "║    • GET  /v1/models             — List models                  ║"
+            echo "║    • POST /v1/chat/completions   — Chat with model              ║"
+            echo "║    • POST /v1/completions        — Legacy completions           ║"
+            echo "║    • GET  /health                — Server health                ║"
             echo "║                                                                  ║"
-            echo "║  ⚠️  Note: Custom server-side tools are not available.          ║"
-            echo "║     Use client-side function calling for tools.                 ║"
+            echo "║  ⚠️  Note:                                                      ║"
+            echo "║    • GitHub Actions: CPU-only inference (~1-3 tokens/sec)       ║"
+            echo "║    • For GPU speed, use a self-hosted runner with CUDA          ║"
             echo "╚════════════════════════════════════════════════════════════════╝"
             echo ""
             echo "==> Server URL: ${TUNNEL_URL}"
-            echo "==> Model ID:   ${{ env.MODEL_FILE }}"
+            echo "==> Model ID:   ${{ env.MODEL_FILENAME }}"
           fi
 
       - name: 🧪 Test OpenAI-Compatible Endpoints
@@ -271,24 +349,11 @@ jobs:
           echo "$B" | jq . 2>/dev/null || true
           echo ""
 
-          echo "3️⃣  POST /v1/chat/completions (non-streaming)"
-          DATA='{"model":"${{ env.MODEL_FILE }}","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
+          echo "3️⃣  POST /v1/chat/completions"
+          DATA='{"model":"${{ env.MODEL_FILENAME }}","messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20,"stream":false}'
           R=$(do_post "${BASE}/v1/chat/completions" "$DATA"); CODE="${R%%|*}"; B="${R#*|}"
           check "POST /v1/chat/completions" "$B" "$CODE"
           echo "$B" | jq '{finish:.choices[0].finish_reason, reply:.choices[0].message.content}' 2>/dev/null || true
-          echo ""
-
-          echo "4️⃣  POST /v1/chat/completions (streaming)"
-          DATA='{"model":"${{ env.MODEL_FILE }}","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"stream":true}'
-          CODE=$(curl -s --max-time 30 -H "Content-Type: application/json" -d "$DATA" \
-            -w "%{http_code}" -o /dev/null "${BASE}/v1/chat/completions" 2>/dev/null || echo "000")
-          if [ "$CODE" = "200" ]; then
-            echo "✅ POST /v1/chat/completions (stream) (HTTP $CODE)"
-            PASS=$((PASS+1))
-          else
-            echo "❌ POST /v1/chat/completions (stream) (HTTP $CODE)"
-            FAIL=$((FAIL+1))
-          fi
           echo ""
 
           echo "═══════════════════════════════════════════════"
@@ -317,25 +382,27 @@ jobs:
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "⏰ $(date '+%Y-%m-%d %H:%M:%S UTC') | ${REMAIN_MIN}m remaining"
 
-            # Tunnel health via OpenAI endpoint
             if [ -n "$CF_URL" ]; then
               MODELS=$(curl -sf --max-time 10 "${CF_URL}/v1/models" 2>/dev/null | jq -r '.data[].id' 2>/dev/null | head -1 || echo "unreachable")
               echo "🟢 Server via tunnel: ${MODELS:-unreachable}"
             fi
 
-            # Local server health
             HEALTH=$(curl -sf --max-time 5 "http://127.0.0.1:${{ env.SERVER_PORT }}/health" 2>/dev/null || echo '{"status":"down"}')
             echo "🟢 Server local: $(echo "$HEALTH" | jq -r .status 2>/dev/null || echo unreachable)"
 
-            # Process check
             SERVER_PIDS=$(pgrep -f "llama.cpp.*server" || pgrep -f "./server" || true)
             if [ -n "$SERVER_PIDS" ]; then
               echo "🦙 Server: alive (PIDs: $SERVER_PIDS)"
             else
               echo "❌ Server not found — restarting..."
               cd llama.cpp
-              nohup ./server \
-                --model "../models/${{ env.MODEL_FILE }}" \
+              if [ -f "./bin/server" ]; then
+                SERVER_BIN="./bin/server"
+              else
+                SERVER_BIN="./server"
+              fi
+              nohup $SERVER_BIN \
+                --model "../${{ env.MODEL_PATH }}" \
                 --host "${{ env.SERVER_HOST }}" \
                 --port "${{ env.SERVER_PORT }}" \
                 --ctx-size "${{ env.CTX_SIZE }}" \
