@@ -1,5 +1,5 @@
 # .github/workflows/main2.yml
-name: Ollama Proxy with Tool Calling - 6 Hour Session
+name: Ollama Proxy with Tool Calling - 6 Hour Session + Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -31,10 +31,12 @@ env:
   PROXY_PORT: '8000'
   OLLAMA_PORT: '11434'
   SESSION_HOURS: ${{ github.event.inputs.session_hours || '6' }}
+  # Will be set by tunnel step
+  CLOUDFLARE_URL: ''
 
 jobs:
   ollama-proxy:
-    name: Ollama Proxy with Tool Calling
+    name: Ollama Proxy + Cloudflare Tunnel
     runs-on: ubuntu-latest
     timeout-minutes: 400
     
@@ -48,14 +50,13 @@ jobs:
           python-version: '3.11'
 
       - name: 📥 Install System Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq curl wget lsof net-tools jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq curl wget lsof net-tools jq grep
 
       - name: 📥 Install Python Dependencies
         run: |
           pip install --upgrade pip --quiet
           pip install --quiet fastapi uvicorn[standard] requests pydantic starlette psutil numpy
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
-          pip list --format=freeze | grep -E "^(fastapi|uvicorn|torch|psutil)==" || true
 
       - name: 📥 Install Ollama
         run: |
@@ -67,7 +68,7 @@ jobs:
           curl -fsSL -o /tmp/cf.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i /tmp/cf.deb 2>/dev/null || true
           rm -f /tmp/cf.deb
-          cloudflared --version 2>/dev/null || true
+          cloudflared --version 2>/dev/null && echo "✅ Cloudflared installed" || echo "⚠️ Cloudflared failed"
 
       - name: 🚀 Start Ollama Server
         run: |
@@ -82,6 +83,7 @@ jobs:
             sleep 2
           done
           timeout 600 ollama pull ${{ env.MODEL }} || true
+          echo "✅ Ollama ready"
 
       - name: 🚀 Start Proxy Server
         run: |
@@ -100,43 +102,186 @@ jobs:
             [ $i -eq 20 ] && echo "❌ Proxy failed" && tail -20 proxy.log && exit 1
             sleep 3
           done
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health | python3 -m json.tool || true
+          echo "✅ Proxy ready on port ${{ env.PROXY_PORT }}"
 
-      - name: 🧪 Test Tool Calling
+      # ═══════════════════════════════════════════════════════════════════
+      # 🌐 CLOUDFLARE TUNNEL STEP - Shows Public URL
+      # ═══════════════════════════════════════════════════════════════════
+      - name: 🌐 Start Cloudflare Tunnel & Show URL
         run: |
-          echo "🧪 Testing endpoints..."
-          curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/v1/tools | python3 -m json.tool | head -10 || true
-          curl -sf -X POST http://127.0.0.1:${{ env.PROXY_PORT }}/v1/tool/execute \
-            -H "Content-Type: application/json" \
-            -d '{"name":"calculate","arguments":{"expression":"2+2*3"}}' | python3 -m json.tool || true
+          echo "🌐 Starting Cloudflare tunnel..."
+          
+          # Kill any existing cloudflared
+          pkill -9 -f cloudflared 2>/dev/null || true
+          sleep 1
+          
+          # Start tunnel in background, logging to file
+          nohup cloudflared tunnel --url http://localhost:${{ env.PROXY_PORT }} > tunnel.log 2>&1 &
+          echo $! > tunnel.pid
+          
+          # Wait for tunnel URL to appear in logs (max 30 seconds)
+          echo "⏳ Waiting for tunnel URL (max 30s)..."
+          TUNNEL_URL=""
+          for i in {1..15}; do
+            # Extract URL from log using grep + sed
+            TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log 2>/dev/null | head -1)
+            if [ -n "$TUNNEL_URL" ]; then
+              echo "✅ Tunnel URL found!"
+              break
+            fi
+            [ $i -eq 15 ] && echo "⚠️ Tunnel URL not found in time" && break
+            sleep 2
+          done
+          
+          # Save URL to env file for later steps
+          if [ -n "$TUNNEL_URL" ]; then
+            echo "CLOUDFLARE_URL=$TUNNEL_URL" >> $GITHUB_ENV
+            echo ""
+            echo "╔════════════════════════════════════════════════════════╗"
+            echo "║  🌐  YOUR PUBLIC CLOUDFLARE URL IS READY!  🌐          ║"
+            echo "╠════════════════════════════════════════════════════════╣"
+            echo "║                                                        ║"
+            echo "║  🔗  $TUNNEL_URL  ║"
+            echo "║                                                        ║"
+            echo "║  Use in your client:                                   ║"
+            echo "║  • OpenAI API:  api_base='$TUNNEL_URL/v1'              ║"
+            echo "║  • Anthropic:   base_url='$TUNNEL_URL/v1'              ║"
+            echo "║  • API Key:     any-value (not validated)              ║"
+            echo "║                                                        ║"
+            echo "║  Test endpoints:                                       ║"
+            echo "║  • curl $TUNNEL_URL/health                   ║"
+            echo "║  • curl $TUNNEL_URL/v1/models                ║"
+            echo "║  • curl $TUNNEL_URL/v1/tools                 ║"
+            echo "║                                                        ║"
+            echo "╚════════════════════════════════════════════════════════╝"
+            echo ""
+            
+            # Also log to GitHub Actions output for visibility
+            echo "::notice::🌐 Public URL: $TUNNEL_URL"
+            echo "::notice::Use api_base='$TUNNEL_URL/v1' in your client"
+          else
+            echo "❌ Failed to get tunnel URL"
+            echo "=== Tunnel Log ==="
+            cat tunnel.log 2>/dev/null | tail -20 || true
+          fi
 
-      - name: ⏱️ Session Pulser (${{ env.SESSION_HOURS }}h)
+      - name: 🧪 Test Public Tunnel URL
+        if: env.CLOUDFLARE_URL != ''
+        run: |
+          echo "🧪 Testing public tunnel URL: ${{ env.CLOUDFLARE_URL }}"
+          
+          # Test health endpoint via public URL
+          echo "1️⃣  Testing /health via tunnel..."
+          curl -sf --max-time 10 "${{ env.CLOUDFLARE_URL }}/health" | python3 -m json.tool || echo "⚠️ Health check failed"
+          echo ""
+          
+          # Test models endpoint
+          echo "2️⃣  Testing /v1/models via tunnel..."
+          curl -sf --max-time 10 "${{ env.CLOUDFLARE_URL }}/v1/models" | python3 -m json.tool | head -8 || echo "⚠️ Models check failed"
+          echo ""
+          
+          # Test basic chat via tunnel
+          echo "3️⃣  Testing chat via tunnel..."
+          curl -sf --max-time 30 -X POST "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer any" \
+            -d '{"model": "'"${{ env.MODEL }}"'", "messages": [{"role": "user", "content": "Hi!"}], "max_tokens": 30}' \
+            | python3 -m json.tool | head -12 || echo "⚠️ Chat test failed"
+          echo ""
+          
+          echo "✅ Public tunnel tests completed"
+
+      - name: ⏱️ Session Pulser (${{ env.SESSION_HOURS }}h) + Tunnel Status
         run: |
           SESSION_SECONDS=$((${{ env.SESSION_HOURS }} * 3600))
           echo "⏱️ Starting ${SESSION_SECONDS}s pulser..."
+          
+          # Show tunnel URL at start of pulser (in case user missed it)
+          if [ -n "${{ env.CLOUDFLARE_URL }}" ]; then
+            echo ""
+            echo "🌐 Your public URL (valid for this session):"
+            echo "   ${{ env.CLOUDFLARE_URL }}"
+            echo ""
+          fi
+          
           START=$(date +%s); END=$((START + SESSION_SECONDS))
           while [ $(date +%s) -lt $END ]; do
             ELAPSED=$(($(date +%s) - START)); REMAINING=$((END - $(date +%s)))
             PCT=$((ELAPSED * 100 / SESSION_SECONDS))
+            
+            echo ""
+            echo "════════════════════════════════════"
             echo "⏰ $(date '+%H:%M:%S') | ${PCT}% | ${REMAINING}s left"
-            curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "🏥 down"
-            tail -n 3 proxy.log 2>/dev/null | sed 's/^/📝 /' || true
+            
+            # Show tunnel status if available
+            if [ -n "${{ env.CLOUDFLARE_URL }}" ]; then
+              TUNNEL_STATUS=$(curl -sf --max-time 5 "${{ env.CLOUDFLARE_URL }}/health" 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "down")
+              echo "🌐 Tunnel: $TUNNEL_STATUS | ${{ env.CLOUDFLARE_URL }}"
+            fi
+            
+            # Local proxy status
+            LOCAL_STATUS=$(curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','?'))" 2>/dev/null || echo "down")
+            echo "🏥 Local: $LOCAL_STATUS"
+            
+            # Recent logs
+            echo "📝 Activity:"
+            tail -n 3 proxy.log 2>/dev/null | sed 's/^/   /' || true
+            
+            echo "════════════════════════════════════"
+            
             sleep 300
           done
           echo "🏁 Session complete!"
 
-      - name: 📊 Final Report
+      - name: 📊 Final Report + Tunnel URL Reminder
         if: always()
         run: |
           echo "📊 Final Report"
+          echo "════════════════════════════════════"
+          
+          # Reminder of tunnel URL
+          if [ -n "${{ env.CLOUDFLARE_URL }}" ]; then
+            echo "🌐 Public URL was: ${{ env.CLOUDFLARE_URL }}"
+            echo "   (Tunnel is now closed)"
+            echo ""
+          fi
+          
+          echo "🏥 Final local health:"
           curl -sf http://127.0.0.1:${{ env.PROXY_PORT }}/health 2>/dev/null | python3 -m json.tool || echo "Proxy down"
-          tail -n 20 proxy.log 2>/dev/null | sed 's/^/   /' || true
+          
+          echo ""
+          echo "📝 Last proxy logs:"
+          tail -n 15 proxy.log 2>/dev/null | sed 's/^/   /' || true
+          
+          echo ""
+          echo "════════════════════════════════════"
+          echo "✅ Workflow completed"
 
-      - name: 🛑 Cleanup
+      - name: 🛑 Cleanup (Kill Tunnel + Services)
         if: always()
         run: |
-          [ -f proxy.pid ] && kill -9 $(cat proxy.pid) 2>/dev/null || true
-          [ -f ollama.pid ] && kill -9 $(cat ollama.pid) 2>/dev/null || true
+          echo "🛑 Cleaning up..."
+          
+          # Kill cloudflared tunnel
+          if [ -f tunnel.pid ]; then
+            kill -9 $(cat tunnel.pid) 2>/dev/null && echo "✅ Killed cloudflared" || true
+          fi
+          pkill -9 -f cloudflared 2>/dev/null || true
+          
+          # Kill proxy
+          if [ -f proxy.pid ]; then
+            kill -9 $(cat proxy.pid) 2>/dev/null && echo "✅ Killed proxy" || true
+          fi
+          
+          # Kill Ollama
+          if [ -f ollama.pid ]; then
+            kill -9 $(cat ollama.pid) 2>/dev/null && echo "✅ Killed Ollama" || true
+          fi
+          
+          # Force kill ports
           sudo fuser -k ${{ env.PROXY_PORT }}/tcp ${{ env.OLLAMA_PORT }}/tcp 2>/dev/null || true
-          rm -f proxy.pid ollama.pid 2>/dev/null || true
-          echo "✅ Cleanup done"
+          
+          # Cleanup files
+          rm -f proxy.pid ollama.pid tunnel.pid 2>/dev/null || true
+          
+          echo "✅ Cleanup complete"
