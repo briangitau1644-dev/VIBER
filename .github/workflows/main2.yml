@@ -1,4 +1,4 @@
-name: Senior Engineer - Ollama Gemma4 e4b0s
+name: Senior Engineer - Ollama Gemma4 e4b
 
 on:
   workflow_dispatch:
@@ -22,11 +22,11 @@ env:
   TEMPERATURE: ${{ github.event.inputs.temperature || '0.2' }}
   OLLAMA_PORT: '11434'
   PROXY_PORT: '1234'
-  MODEL: 'gemma4:e4b0s'
+  MODEL: 'gemma4:e4b'
 
 jobs:
   senior-engineer-ollama-gemma4:
-    name: Gemma4:e4b0s via Ollama
+    name: Gemma4:e4b via Ollama
     runs-on: ubuntu-latest
     timeout-minutes: 400
 
@@ -65,13 +65,14 @@ jobs:
 
       - name: Pull & Warm Model
         run: |
+          echo "📦 Pulling $MODEL ..."
           OLLAMA_HOST=127.0.0.1:$OLLAMA_PORT ollama pull "$MODEL"
-          echo "Warming up..."
+          echo "🔥 Warming up..."
           curl -sf "http://127.0.0.1:$OLLAMA_PORT/api/chat" \
             -H "Content-Type: application/json" \
             -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"options\":{\"num_predict\":5}}" \
-            --max-time 120 > /dev/null
-          echo "✅ Model warm"
+            --max-time 180 > /dev/null
+          echo "✅ Model warm & ready"
 
       - name: Start Proxy
         run: |
@@ -88,7 +89,7 @@ jobs:
           fi
           echo "✅ Proxy process alive (PID: $(cat proxy.pid))"
           
-          echo "Waiting for /health endpoint..."
+          echo "⏳ Waiting for /health endpoint..."
           for i in $(seq 1 15); do
             HTTP=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$PROXY_PORT/health" --max-time 3 2>/dev/null)
             [ "$HTTP" = "200" ] && { echo "✅ Proxy healthy on :$PROXY_PORT"; break; }
@@ -121,6 +122,15 @@ jobs:
           echo "CLOUDFLARE_URL=${URL%/}" >> $GITHUB_ENV
           echo "✅ Tunnel: $URL"
 
+      - name: Smoke Test via Tunnel
+        if: env.CLOUDFLARE_URL != ''
+        run: |
+          echo "🧪 Testing through tunnel..."
+          curl -sf "${{ env.CLOUDFLARE_URL }}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d '{"model":"'"$MODEL"'","messages":[{"role":"user","content":"Write a 1-line Python print statement."}],"max_tokens":20}' \
+            --max-time 60 | jq -r '.choices[0].message.content // "parse warning"' || echo "Smoke test finished"
+
       - name: Keepalive
         run: |
           END=$(( $(date +%s) + SESSION_HOURS * 3600 ))
@@ -135,3 +145,4 @@ jobs:
         run: |
           for f in proxy.pid ollama.pid tunnel.pid; do [ -f "$f" ] && kill -9 $(cat "$f") 2>/dev/null || true; done
           pkill -9 -f cloudflared 2>/dev/null || true; pkill -9 -f ollama 2>/dev/null || true
+          echo "🧹 Cleanup complete"
