@@ -12,182 +12,85 @@ on:
           - '2'
           - '4'
           - '6'
-      model:
-        description: 'Gemma 4 model variant'
-        required: true
-        default: 'gemma4:e4b'
-        type: choice
-        options:
-          - 'gemma4:e4b'
-          - 'gemma4:e2b'
-          - 'gemma4:26b'
-          - 'gemma4:31b'
 
 jobs:
   ollama-tunnel:
-    runs-on: [self-hosted, gpu]  # IMPORTANT: Replace with your self-hosted runner labels
-    timeout-minutes: 420  # 7 hours max (GitHub limit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 420
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      # ============================================================
-      # STEP 1: Install Ollama (requires v0.20.0+ for Gemma 4)
-      # ============================================================
       - name: Install Ollama
         run: |
-          echo "Installing Ollama..."
           curl -fsSL https://ollama.com/install.sh | sh
-          echo "Ollama installation complete"
       
-      # ============================================================
-      # STEP 2: Start Ollama server with proper configuration
-      # ============================================================
       - name: Start Ollama Server
         run: |
-          # Kill any existing Ollama processes
-          pkill ollama || true
-          sleep 2
-          
-          # Configure Ollama for remote access
           export OLLAMA_HOST=0.0.0.0
           export OLLAMA_ORIGINS="*"
           export OLLAMA_NUM_PARALLEL=4
           export OLLAMA_MAX_LOADED_MODELS=2
-          export OLLAMA_DEBUG=1
           
-          # Start Ollama server in background
           nohup ollama serve > ollama.log 2>&1 &
           
-          # Wait for Ollama to be ready (max 30 seconds)
           for i in {1..30}; do
             if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
               echo "Ollama server is ready"
               break
             fi
-            echo "Waiting for Ollama server... ($i/30)"
             sleep 2
           done
       
-      # ============================================================
-      # STEP 3: Pull Gemma 4 E4B model (9.6GB)
-      # ============================================================
-      - name: Pull Gemma 4 Model
+      - name: Pull and Run Gemma 4 E4B
         run: |
-          echo "Pulling ${{ github.event.inputs.model }} (this may take several minutes)..."
-          ollama pull ${{ github.event.inputs.model }}
-          
-          echo ""
-          echo "Installed models:"
-          ollama list
+          ollama run gemma4:e4b
       
-      # ============================================================
-      # STEP 4: Create GPT-4 alias for Continue Agent Mode
-      # This tricks Continue into enabling Agent/Plan mode
-      # ============================================================
       - name: Create GPT-4 Alias
         run: |
-          # Create alias for Continue Agent Mode support
-          ollama cp ${{ github.event.inputs.model }} gpt-4o
-          
-          # Also create codestral alias for autocomplete
-          ollama cp ${{ github.event.inputs.model }} codestral
-          
-          echo "Aliases created successfully:"
-          ollama list | grep -E "(gpt-4o|codestral)" || echo "Aliases verified"
+          ollama cp gemma4:e4b gpt-4o
+          ollama cp gemma4:e4b codestral
       
-      # ============================================================
-      # STEP 5: Test model with proper headers
-      # ============================================================
-      - name: Test Gemma 4 Model
-        run: |
-          echo "Testing ${{ github.event.inputs.model }}..."
-          
-          # Test with direct API call
-          curl -X POST http://localhost:11434/api/generate \
-            -H "Content-Type: application/json" \
-            -H "Accept: application/json" \
-            -d '{
-              "model": "${{ github.event.inputs.model }}",
-              "prompt": "Say exactly: Gemma 4 is ready",
-              "stream": false
-            }' | jq -r '.response' || echo "Test completed"
-          
-          echo ""
-          echo "✅ Model test passed!"
-      
-      # ============================================================
-      # STEP 6: Install cloudflared for tunneling
-      # ============================================================
       - name: Install cloudflared
         run: |
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
           sudo mv cloudflared /usr/local/bin/
-          cloudflared --version
       
-      # ============================================================
-      # STEP 7: Create Cloudflare Tunnel and output URL
-      # ============================================================
       - name: Create Cloudflare Tunnel
         id: tunnel
         run: |
-          # Start cloudflared tunnel to Ollama with proper headers
           cloudflared tunnel --url http://localhost:11434 \
             --http-host-header localhost:11434 \
             --logfile cloudflared.log &
           
-          # Wait for tunnel to establish
           sleep 15
           
-          # Extract the tunnel URL from logs
           TUNNEL_URL=$(grep -o 'https://[a-zA-Z0-9.-]*\.trycloudflare\.com' cloudflared.log | head -1)
-          
-          if [ -z "$TUNNEL_URL" ]; then
-            echo "❌ Failed to get tunnel URL"
-            echo "Last 20 lines of cloudflared.log:"
-            tail -20 cloudflared.log
-            exit 1
-          fi
           
           echo "TUNNEL_URL=$TUNNEL_URL" >> $GITHUB_ENV
           echo "tunnel_url=$TUNNEL_URL" >> $GITHUB_OUTPUT
           
-          # Display connection info
           echo ""
-          echo "╔════════════════════════════════════════════════════════════════╗"
-          echo "║                    ✅ TUNNEL IS ACTIVE!                         ║"
-          echo "╚════════════════════════════════════════════════════════════════╝"
+          echo "=========================================="
+          echo "TUNNEL ACTIVE: $TUNNEL_URL"
+          echo "=========================================="
           echo ""
-          echo "🌐 Public URL: $TUNNEL_URL"
-          echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          echo "📋 COPY THIS CONFIGURATION for your local VS Code Continue:"
+          echo "VS CODE CONTINUE CONFIG:"
           echo ""
           echo '{
             "models": [
               {
-                "title": "Gemma 4 E4B (GitHub Tunnel)",
+                "title": "Gemma 4 E4B",
                 "provider": "openai",
                 "model": "gpt-4o",
                 "apiBase": "'$TUNNEL_URL'/v1",
                 "apiKey": "ollama",
-                "roles": ["chat", "edit", "apply"],
                 "capabilities": ["tool_use"],
                 "supportsTools": true,
                 "requestOptions": {
                   "headers": {
                     "Content-Type": "application/json",
                     "Accept": "application/json"
-                  },
-                  "timeout": 120000
-                },
-                "completionOptions": {
-                  "temperature": 1.0,
-                  "topP": 0.95,
-                  "topK": 64
+                  }
                 }
               }
             ],
@@ -200,36 +103,10 @@ jobs:
             }
           }'
           echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          echo "🧪 Test the connection with:"
-          echo "  curl $TUNNEL_URL/api/tags"
-          echo ""
-          echo "⏱️  Tunnel will remain active for ${{ github.event.inputs.duration }} hours"
-          echo ""
+          echo "=========================================="
       
-      # ============================================================
-      # STEP 8: Keep runner alive for the specified duration
-      # ============================================================
       - name: Keep Runner Alive
         run: |
-          echo "🟢 Tunnel is running at: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "🟢 Press Ctrl+C in GitHub Actions UI to stop early"
-          echo "🟢 Will automatically stop after ${{ github.event.inputs.duration }} hours"
-          echo ""
-          echo "📊 Live logs available in GitHub Actions"
-          
-          # Keep workflow alive
+          echo "Tunnel active for ${{ github.event.inputs.duration }} hours"
+          echo "Connect via: ${{ steps.tunnel.outputs.tunnel_url }}"
           sleep ${{ github.event.inputs.duration }}h
-      
-      # ============================================================
-      # STEP 9: Display logs on failure
-      # ============================================================
-      - name: Display Logs on Failure
-        if: failure()
-        run: |
-          echo "=== Ollama Server Logs ==="
-          cat ollama.log 2>/dev/null || echo "No ollama.log found"
-          echo ""
-          echo "=== Cloudflare Tunnel Logs ==="
-          cat cloudflared.log 2>/dev/null || echo "No cloudflared.log found"
